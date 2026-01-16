@@ -3,7 +3,6 @@ import base64
 import time
 from typing import Any, Dict, Optional
 from datetime import datetime, timedelta
-from enum import Enum
 import json
 
 from requests.exceptions import HTTPError
@@ -12,11 +11,9 @@ from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.exceptions import InvalidSignature
 
+import ssl
 import websockets
-
-class Environment(Enum):
-    DEMO = "demo"
-    PROD = "prod"
+import certifi
 
 class KalshiBaseClient:
     """Base client class for interacting with the Kalshi API."""
@@ -24,28 +21,18 @@ class KalshiBaseClient:
         self,
         key_id: str,
         private_key: rsa.RSAPrivateKey,
-        environment: Environment = Environment.DEMO,
     ):
         """Initializes the client with the provided API key and private key.
 
         Args:
             key_id (str): Your Kalshi API key ID.
             private_key (rsa.RSAPrivateKey): Your RSA private key.
-            environment (Environment): The API environment to use (DEMO or PROD).
         """
         self.key_id = key_id
         self.private_key = private_key
-        self.environment = environment
         self.last_api_call = datetime.now()
-
-        if self.environment == Environment.DEMO:
-            self.HTTP_BASE_URL = "https://demo-api.kalshi.co"
-            self.WS_BASE_URL = "wss://demo-api.kalshi.co"
-        elif self.environment == Environment.PROD:
-            self.HTTP_BASE_URL = "https://api.elections.kalshi.com"
-            self.WS_BASE_URL = "wss://api.elections.kalshi.com"
-        else:
-            raise ValueError("Invalid environment")
+        self.HTTP_BASE_URL = "https://api.elections.kalshi.com"
+        self.WS_BASE_URL = "wss://api.elections.kalshi.com"
 
     def request_headers(self, method: str, path: str) -> Dict[str, Any]:
         """Generates the required authentication headers for API requests."""
@@ -88,9 +75,8 @@ class KalshiHttpClient(KalshiBaseClient):
         self,
         key_id: str,
         private_key: rsa.RSAPrivateKey,
-        environment: Environment = Environment.DEMO,
     ):
-        super().__init__(key_id, private_key, environment)
+        super().__init__(key_id, private_key)
         self.host = self.HTTP_BASE_URL
         self.exchange_url = "/trade-api/v2/exchange"
         self.markets_url = "/trade-api/v2/markets"
@@ -125,8 +111,12 @@ class KalshiHttpClient(KalshiBaseClient):
     def get(self, path: str, params: Dict[str, Any] = {}) -> Any:
         """Performs an authenticated GET request to the Kalshi API."""
         self.rate_limit()
+        full_url = self.host + path
+        # #region agent log
+        with open('/Users/tommasosini/kalshi-starter-code-python/.cursor/debug.log', 'a') as f: f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"B","location":"clients.py:114","message":"GET request","data":{"full_url":full_url,"path":path,"params":params},"timestamp":int(time.time()*1000)})+"\n")
+        # #endregion
         response = requests.get(
-            self.host + path,
+            full_url,
             headers=self.request_headers("GET", path),
             params=params
         )
@@ -172,24 +162,24 @@ class KalshiHttpClient(KalshiBaseClient):
         params = {k: v for k, v in params.items() if v is not None}
         return self.get(self.markets_url + '/trades', params=params)
 
+
 class KalshiWebSocketClient(KalshiBaseClient):
     """Client for handling WebSocket connections to the Kalshi API."""
     def __init__(
         self,
         key_id: str,
         private_key: rsa.RSAPrivateKey,
-        environment: Environment = Environment.DEMO,
     ):
-        super().__init__(key_id, private_key, environment)
+        super().__init__(key_id, private_key)
         self.ws = None
         self.url_suffix = "/trade-api/ws/v2"
-        self.message_id = 1  # Add counter for message IDs
 
     async def connect(self):
         """Establishes a WebSocket connection using authentication."""
         host = self.WS_BASE_URL + self.url_suffix
         auth_headers = self.request_headers("GET", self.url_suffix)
-        async with websockets.connect(host, additional_headers=auth_headers) as websocket:
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+        async with websockets.connect(host, additional_headers=auth_headers, ssl=ssl_context) as websocket:
             self.ws = websocket
             await self.on_open()
             await self.handler()
@@ -197,19 +187,6 @@ class KalshiWebSocketClient(KalshiBaseClient):
     async def on_open(self):
         """Callback when WebSocket connection is opened."""
         print("WebSocket connection opened.")
-        await self.subscribe_to_tickers()
-
-    async def subscribe_to_tickers(self):
-        """Subscribe to ticker updates for all markets."""
-        subscription_message = {
-            "id": self.message_id,
-            "cmd": "subscribe",
-            "params": {
-                "channels": ["ticker"]
-            }
-        }
-        await self.ws.send(json.dumps(subscription_message))
-        self.message_id += 1
 
     async def handler(self):
         """Handle incoming messages."""

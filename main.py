@@ -1,44 +1,41 @@
+from cryptography.hazmat.primitives import serialization
 import os
 from dotenv import load_dotenv
-from cryptography.hazmat.primitives import serialization
-import asyncio
 
-from clients import KalshiHttpClient, KalshiWebSocketClient, Environment
+from clients import KalshiHttpClient
 
-# Load environment variables
+# Load environment variables from .env file
 load_dotenv()
-env = Environment.DEMO # toggle environment here
-KEYID = os.getenv('DEMO_KEYID') if env == Environment.DEMO else os.getenv('PROD_KEYID')
-KEYFILE = os.getenv('DEMO_KEYFILE') if env == Environment.DEMO else os.getenv('PROD_KEYFILE')
 
-try:
-    with open(KEYFILE, "rb") as key_file:
-        private_key = serialization.load_pem_private_key(
-            key_file.read(),
-            password=None  # Provide the password if your key is encrypted
-        )
-except FileNotFoundError:
-    raise FileNotFoundError(f"Private key file not found at {KEYFILE}")
-except Exception as e:
-    raise Exception(f"Error loading private key: {str(e)}")
+# Get credentials from environment variables
+KEYID = os.getenv("KALSHI_KEY_ID")
+PRIVATE_KEY_PATH = os.getenv("PRIVATE_KEY_PATH", "private_key.pem")
+
+if not KEYID:
+    raise ValueError("KALSHI_KEY_ID not found in environment variables")
+
+if not os.path.exists(PRIVATE_KEY_PATH):
+    raise FileNotFoundError(f"Private key file not found: {PRIVATE_KEY_PATH}")
+
+# Load private key from .pem file
+with open(PRIVATE_KEY_PATH, "rb") as key_file:
+    private_key_pem = key_file.read()
+
+private_key = serialization.load_pem_private_key(
+    private_key_pem,
+    password=None,
+)
 
 # Initialize the HTTP client
 client = KalshiHttpClient(
     key_id=KEYID,
-    private_key=private_key,
-    environment=env
+    private_key=private_key
 )
 
 # Get account balance
 balance = client.get_balance()
 print("Balance:", balance)
 
-# Initialize the WebSocket client
-ws_client = KalshiWebSocketClient(
-    key_id=KEYID,
-    private_key=private_key,
-    environment=env
-)
-
-# Connect via WebSocket
-asyncio.run(ws_client.connect())
+# Extract portfolio value from balance response
+portfolio_value = balance.get('portfolio_value')
+print("Portfolio Value:", portfolio_value)

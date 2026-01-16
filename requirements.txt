@@ -5,3 +5,4 @@ urllib3==2.3.0
 python-dotenv==1.0.1
 websockets==14.1
 datetime==5.5
+certifi==2024.8.30
