@@ -1,8 +1,9 @@
 from cryptography.hazmat.primitives import serialization
 import os
+import asyncio
 from dotenv import load_dotenv
 
-from clients import KalshiHttpClient
+from clients import KalshiWebSocketClient
 
 # Load environment variables from .env file
 load_dotenv()
@@ -26,16 +27,28 @@ private_key = serialization.load_pem_private_key(
     password=None,
 )
 
-# Initialize the HTTP client
-client = KalshiHttpClient(
-    key_id=KEYID,
-    private_key=private_key
-)
+async def stream_orderbook():
+    """Connect to WebSocket and stream orderbook data for a market ticker."""
+    # Ask for market ticker
+    market_ticker = input("Enter market ticker: ").strip()
+    
+    if not market_ticker:
+        print("Error: Market ticker cannot be empty")
+        return
+    
+    # Initialize the WebSocket client
+    client = KalshiWebSocketClient(
+        key_id=KEYID,
+        private_key=private_key
+    )
+    
+    # Connect and stream
+    try:
+        await client.connect(market_ticker=market_ticker)
+    except KeyboardInterrupt:
+        print("\nStreaming stopped by user")
+    except Exception as e:
+        print(f"Error: {e}")
 
-# Get account balance
-balance = client.get_balance()
-print("Balance:", balance)
-
-# Extract portfolio value from balance response
-portfolio_value = balance.get('portfolio_value')
-print("Portfolio Value:", portfolio_value)
+if __name__ == "__main__":
+    asyncio.run(stream_orderbook())
