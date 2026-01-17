@@ -501,6 +501,61 @@ def seed_book_with_rest_snapshot(market_ticker: str) -> Tuple[List[List[int]], L
 
 
 # -----------------------------
+# Position Sizing Configuration
+# -----------------------------
+POSITION_PCT = 0.01  # % of portfolio to trade
+
+
+def compute_shares_from_budget(target_usd: float, price_cents: int) -> Optional[int]:
+    """
+    Compute integer share count from USD budget and price in cents.
+    
+    Args:
+        target_usd: Target USD budget for the trade
+        price_cents: Limit price in cents (1-99)
+    
+    Returns:
+        Integer share count, or None if invalid/too small
+    """
+    if price_cents <= 0:
+        return None
+    
+    # Convert cents to dollars
+    price_dollars = price_cents / 100.0
+    
+    if price_dollars <= 0:
+        return None
+    
+    # Compute shares using floor division
+    shares = int(target_usd // price_dollars)
+    
+    # Safety: must be at least 1 share
+    if shares < 1:
+        return None
+    
+    return shares
+
+
+def get_portfolio_usd(balance_data: Dict[str, Any]) -> float:
+    """
+    Extract portfolio USD value from balance response.
+    Balance is returned in cents, so divide by 100.
+    """
+    balance = balance_data.get("balance") or balance_data.get("portfolio_balance")
+    if balance is None:
+        return 0.0
+    
+    if isinstance(balance, (int, float)):
+        return balance / 100.0
+    elif isinstance(balance, str):
+        try:
+            return float(balance)
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+# -----------------------------
 # Position Tracker
 # -----------------------------
 @dataclass
@@ -607,12 +662,13 @@ async def keyboard_input_handler(
     book: OrderBook, 
     http_client: KalshiHttpClient, 
     market_ticker: str,
-    position_tracker: PositionTracker
+    position_tracker: PositionTracker,
+    position_pct: float = POSITION_PCT
 ):
     """
     Handle keyboard input asynchronously:
-    - 'q': Buy YES at ask price (10 shares)
-    - 'w': Buy NO at ask price (10 shares)
+    - 'q': Buy YES at ask price (sized as percentage of portfolio)
+    - 'w': Buy NO at ask price (sized as percentage of portfolio)
     """
     # Set stdin to non-blocking mode
     old_settings = termios.tcgetattr(sys.stdin)
@@ -633,29 +689,58 @@ async def keyboard_input_handler(
                         sys.stdout.flush()
                         continue
                     
-                    # Buy YES at ask price
+                    # Fetch portfolio balance
+                    try:
+                        balance_data = http_client.get_balance()
+                        portfolio_usd = get_portfolio_usd(balance_data)
+                    except Exception as e:
+                        sys.stdout.write(f"\n[ORDER ERROR] Failed to fetch balance: {e}\n")
+                        sys.stdout.flush()
+                        continue
+                    
+                    # Compute target USD
+                    target_usd = portfolio_usd * position_pct
+                    
+                    # Get limit price (ask for BUY)
                     async with book.lock:
                         ya = book.best_yes_ask_implied()
                     
-                    if ya is not None:
-                        try:
-                            result = http_client.create_order(
-                                ticker=market_ticker,
-                                action="buy",
-                                side="yes",
-                                count=5,
-                                yes_price=ya,
-                                order_type="limit"
-                            )
-                            order_id = result.get("order", {}).get("order_id", "unknown")
-                            await position_tracker.register_pending_buy_order("yes", 5, order_id)
-                            sys.stdout.write(f"\n[ORDER] YES BUY @ {ya} - 5 shares - Order ID: {order_id}\n")
-                            sys.stdout.flush()
-                        except Exception as e:
-                            sys.stdout.write(f"\n[ORDER ERROR] YES BUY failed: {e}\n")
-                            sys.stdout.flush()
-                    else:
+                    if ya is None:
                         sys.stdout.write(f"\n[ORDER ERROR] YES ask price not available\n")
+                        sys.stdout.flush()
+                        continue
+                    
+                    # Compute shares from budget
+                    shares = compute_shares_from_budget(target_usd, ya)
+                    if shares is None:
+                        sys.stdout.write(f"\n[ORDER ERROR] Budget too small: portfolio=${portfolio_usd:.2f}, target=${target_usd:.2f} ({position_pct*100:.0f}%), price={ya} cents\n")
+                        sys.stdout.flush()
+                        continue
+                    
+                    # Compute estimated cost
+                    price_dollars = ya / 100.0
+                    est_cost = shares * price_dollars
+                    
+                    # Log sizing details
+                    sys.stdout.write(f"\n[SIZING] portfolio=${portfolio_usd:.2f}, target=${target_usd:.2f} ({position_pct*100:.0f}%), price=${price_dollars:.2f}, shares={shares}, est_cost=${est_cost:.2f}\n")
+                    sys.stdout.flush()
+                    
+                    # Place order
+                    try:
+                        result = http_client.create_order(
+                            ticker=market_ticker,
+                            action="buy",
+                            side="yes",
+                            count=shares,
+                            yes_price=ya,
+                            order_type="limit"
+                        )
+                        order_id = result.get("order", {}).get("order_id", "unknown")
+                        await position_tracker.register_pending_buy_order("yes", shares, order_id)
+                        sys.stdout.write(f"\n[ORDER] YES BUY @ {ya} - {shares} shares - Order ID: {order_id}\n")
+                        sys.stdout.flush()
+                    except Exception as e:
+                        sys.stdout.write(f"\n[ORDER ERROR] YES BUY failed: {e}\n")
                         sys.stdout.flush()
                 
                 elif char == 'w':
@@ -666,29 +751,58 @@ async def keyboard_input_handler(
                         sys.stdout.flush()
                         continue
                     
-                    # Buy NO at ask price
+                    # Fetch portfolio balance
+                    try:
+                        balance_data = http_client.get_balance()
+                        portfolio_usd = get_portfolio_usd(balance_data)
+                    except Exception as e:
+                        sys.stdout.write(f"\n[ORDER ERROR] Failed to fetch balance: {e}\n")
+                        sys.stdout.flush()
+                        continue
+                    
+                    # Compute target USD
+                    target_usd = portfolio_usd * position_pct
+                    
+                    # Get limit price (ask for BUY)
                     async with book.lock:
                         na = book.best_no_ask_implied()
                     
-                    if na is not None:
-                        try:
-                            result = http_client.create_order(
-                                ticker=market_ticker,
-                                action="buy",
-                                side="no",
-                                count=5,
-                                no_price=na,
-                                order_type="limit"
-                            )
-                            order_id = result.get("order", {}).get("order_id", "unknown")
-                            await position_tracker.register_pending_buy_order("no", 5, order_id)
-                            sys.stdout.write(f"\n[ORDER] NO BUY @ {na} - 5 shares - Order ID: {order_id}\n")
-                            sys.stdout.flush()
-                        except Exception as e:
-                            sys.stdout.write(f"\n[ORDER ERROR] NO BUY failed: {e}\n")
-                            sys.stdout.flush()
-                    else:
+                    if na is None:
                         sys.stdout.write(f"\n[ORDER ERROR] NO ask price not available\n")
+                        sys.stdout.flush()
+                        continue
+                    
+                    # Compute shares from budget
+                    shares = compute_shares_from_budget(target_usd, na)
+                    if shares is None:
+                        sys.stdout.write(f"\n[ORDER ERROR] Budget too small: portfolio=${portfolio_usd:.2f}, target=${target_usd:.2f} ({position_pct*100:.0f}%), price={na} cents\n")
+                        sys.stdout.flush()
+                        continue
+                    
+                    # Compute estimated cost
+                    price_dollars = na / 100.0
+                    est_cost = shares * price_dollars
+                    
+                    # Log sizing details
+                    sys.stdout.write(f"\n[SIZING] portfolio=${portfolio_usd:.2f}, target=${target_usd:.2f} ({position_pct*100:.0f}%), price=${price_dollars:.2f}, shares={shares}, est_cost=${est_cost:.2f}\n")
+                    sys.stdout.flush()
+                    
+                    # Place order
+                    try:
+                        result = http_client.create_order(
+                            ticker=market_ticker,
+                            action="buy",
+                            side="no",
+                            count=shares,
+                            no_price=na,
+                            order_type="limit"
+                        )
+                        order_id = result.get("order", {}).get("order_id", "unknown")
+                        await position_tracker.register_pending_buy_order("no", shares, order_id)
+                        sys.stdout.write(f"\n[ORDER] NO BUY @ {na} - {shares} shares - Order ID: {order_id}\n")
+                        sys.stdout.flush()
+                    except Exception as e:
+                        sys.stdout.write(f"\n[ORDER ERROR] NO BUY failed: {e}\n")
                         sys.stdout.flush()
                 
                 elif char == '\x03':  # Ctrl+C
