@@ -1,9 +1,10 @@
 from cryptography.hazmat.primitives import serialization
 import os
-import asyncio
+import sys
+from pathlib import Path
 from dotenv import load_dotenv
 
-from clients import KalshiWebSocketClient
+from streaming import run_stream
 
 # Load environment variables from .env file
 load_dotenv()
@@ -27,28 +28,25 @@ private_key = serialization.load_pem_private_key(
     password=None,
 )
 
-async def stream_orderbook():
-    """Connect to WebSocket and stream orderbook data for a market ticker."""
-    # Ask for market ticker
-    market_ticker = input("Enter market ticker: ").strip()
+if __name__ == "__main__":
+    import asyncio
     
+    # Get market ticker from env or prompt
+    market_ticker = os.getenv("KALSHI_MARKET_TICKER")
     if not market_ticker:
-        print("Error: Market ticker cannot be empty")
-        return
+        market_ticker = input("Enter market ticker: ").strip()
+        if not market_ticker:
+            print("Error: Market ticker cannot be empty")
+            sys.exit(1)
     
-    # Initialize the WebSocket client
-    client = KalshiWebSocketClient(
-        key_id=KEYID,
-        private_key=private_key
-    )
+    sys.stdout.write(f"[STARTING] Streaming {market_ticker}...\n")
+    sys.stdout.flush()
     
-    # Connect and stream
     try:
-        await client.connect(market_ticker=market_ticker)
+        # Run unbuffered if you want the fastest display:
+        # python -u main.py
+        asyncio.run(run_stream(KEYID, private_key, market_ticker))
     except KeyboardInterrupt:
         print("\nStreaming stopped by user")
     except Exception as e:
         print(f"Error: {e}")
-
-if __name__ == "__main__":
-    asyncio.run(stream_orderbook())

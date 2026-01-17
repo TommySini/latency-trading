@@ -112,9 +112,6 @@ class KalshiHttpClient(KalshiBaseClient):
         """Performs an authenticated GET request to the Kalshi API."""
         self.rate_limit()
         full_url = self.host + path
-        # #region agent log
-        with open('/Users/tommasosini/kalshi-starter-code-python/.cursor/debug.log', 'a') as f: f.write(json.dumps({"sessionId":"debug-session","runId":"run1","hypothesisId":"B","location":"clients.py:114","message":"GET request","data":{"full_url":full_url,"path":path,"params":params},"timestamp":int(time.time()*1000)})+"\n")
-        # #endregion
         response = requests.get(
             full_url,
             headers=self.request_headers("GET", path),
@@ -173,40 +170,16 @@ class KalshiWebSocketClient(KalshiBaseClient):
         super().__init__(key_id, private_key)
         self.ws = None
         self.url_suffix = "/trade-api/ws/v2"
-        self.market_ticker = None
 
-    async def connect(self, market_ticker: Optional[str] = None):
-        """Establishes a WebSocket connection using authentication.
-        
-        Args:
-            market_ticker: Optional market ticker to subscribe to orderbook on connection.
-        """
-        self.market_ticker = market_ticker
+    async def connect(self):
+        """Establishes a WebSocket connection using authentication."""
         host = self.WS_BASE_URL + self.url_suffix
         auth_headers = self.request_headers("GET", self.url_suffix)
         ssl_context = ssl.create_default_context(cafile=certifi.where())
         async with websockets.connect(host, additional_headers=auth_headers, ssl=ssl_context) as websocket:
             self.ws = websocket
             await self.on_open()
-            if self.market_ticker:
-                await self.subscribe_orderbook(self.market_ticker)
             await self.handler()
-
-    async def subscribe_orderbook(self, market_ticker: str):
-        """Subscribe to orderbook updates for a specific market ticker."""
-        if not self.ws:
-            raise RuntimeError("WebSocket not connected. Call connect() first.")
-        
-        subscribe_msg = {
-            "id": 1,
-            "cmd": "subscribe",
-            "params": {
-                "channels": ["orderbook_snapshot", "orderbook_delta"],
-                "market_tickers": [market_ticker]
-            }
-        }
-        await self.ws.send(json.dumps(subscribe_msg))
-        print(f"Subscribed to orderbook for {market_ticker}")
 
     async def on_open(self):
         """Callback when WebSocket connection is opened."""
@@ -224,52 +197,7 @@ class KalshiWebSocketClient(KalshiBaseClient):
 
     async def on_message(self, message):
         """Callback for handling incoming messages."""
-        try:
-            data = json.loads(message)
-            msg_type = data.get("type")
-            
-            if msg_type == "orderbook_snapshot":
-                await self.on_orderbook_snapshot(data)
-            elif msg_type == "orderbook_delta":
-                await self.on_orderbook_delta(data)
-            else:
-                print("Received message:", message)
-        except json.JSONDecodeError:
-            print("Received non-JSON message:", message)
-        except Exception as e:
-            print(f"Error processing message: {e}")
-            print("Raw message:", message)
-
-    async def on_orderbook_snapshot(self, data: Dict[str, Any]):
-        """Handle orderbook snapshot message."""
-        msg = data.get("msg", {})
-        market_ticker = msg.get("market_ticker")
-        yes_levels = msg.get("yes", [])
-        no_levels = msg.get("no", [])
-        yes_dollars = msg.get("yes_dollars", [])
-        no_dollars = msg.get("no_dollars", [])
-        
-        print(f"\n=== Orderbook Snapshot: {market_ticker} ===")
-        print("YES side:")
-        for i, (price, size) in enumerate(yes_levels):
-            price_dollar = yes_dollars[i][0] if i < len(yes_dollars) else f"{price/100:.3f}"
-            print(f"  Price: {price}¢ (${price_dollar}), Size: {size}")
-        print("NO side:")
-        for i, (price, size) in enumerate(no_levels):
-            price_dollar = no_dollars[i][0] if i < len(no_dollars) else f"{price/100:.3f}"
-            print(f"  Price: {price}¢ (${price_dollar}), Size: {size}")
-        print("=" * 50)
-
-    async def on_orderbook_delta(self, data: Dict[str, Any]):
-        """Handle orderbook delta message."""
-        msg = data.get("msg", {})
-        market_ticker = msg.get("market_ticker")
-        price = msg.get("price")
-        price_dollars = msg.get("price_dollars")
-        delta = msg.get("delta")
-        side = msg.get("side")
-        
-        print(f"\n[Delta] {market_ticker} | Side: {side} | Price: {price} ({price_dollars}) | Delta: {delta:+d}")
+        print("Received message:", message)
 
     async def on_error(self, error):
         """Callback for handling errors."""
