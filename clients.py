@@ -159,6 +159,36 @@ class KalshiHttpClient(KalshiBaseClient):
         params = {k: v for k, v in params.items() if v is not None}
         return self.get(self.markets_url + '/trades', params=params)
 
+    def create_order(
+        self,
+        ticker: str,
+        action: str,
+        side: str,
+        count: int,
+        yes_price: Optional[int] = None,
+        no_price: Optional[int] = None,
+        client_order_id: Optional[str] = None,
+        order_type: str = "limit",
+    ) -> Dict[str, Any]:
+        """Creates a limit order."""
+        import uuid
+        
+        body = {
+            "ticker": ticker,
+            "action": action,
+            "side": side,
+            "count": count,
+            "type": order_type,
+            "client_order_id": client_order_id or str(uuid.uuid4()),
+        }
+        
+        if yes_price is not None:
+            body["yes_price"] = yes_price
+        if no_price is not None:
+            body["no_price"] = no_price
+        
+        return self.post(self.portfolio_url + '/orders', body)
+
 
 class KalshiWebSocketClient(KalshiBaseClient):
     """Client for handling WebSocket connections to the Kalshi API."""

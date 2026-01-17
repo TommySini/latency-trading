@@ -5,6 +5,9 @@ import asyncio
 import json
 import time
 import sys
+import select
+import termios
+import tty
 from dataclasses import dataclass, field
 from typing import Dict, Optional, List, Tuple
 
@@ -336,6 +339,82 @@ def seed_book_with_rest_snapshot(market_ticker: str) -> Tuple[List[List[int]], L
     return (yes if isinstance(yes, list) else []), (no if isinstance(no, list) else [])
 
 
+async def keyboard_input_handler(book: OrderBook, http_client: KalshiHttpClient, market_ticker: str):
+    """
+    Handle keyboard input asynchronously:
+    - 'q': Buy YES at ask price (10 shares)
+    - 'w': Buy NO at ask price (10 shares)
+    """
+    # Set stdin to non-blocking mode
+    old_settings = termios.tcgetattr(sys.stdin)
+    tty.setraw(sys.stdin.fileno())
+    
+    try:
+        loop = asyncio.get_event_loop()
+        while True:
+            # Check if input is available (non-blocking)
+            if select.select([sys.stdin], [], [], 0.01)[0]:
+                char = sys.stdin.read(1)
+                
+                if char == 'q':
+                    # Buy YES at ask price
+                    async with book.lock:
+                        ya = book.best_yes_ask_implied()
+                    
+                    if ya is not None:
+                        try:
+                            result = http_client.create_order(
+                                ticker=market_ticker,
+                                action="buy",
+                                side="yes",
+                                count=10,
+                                yes_price=ya,
+                                order_type="limit"
+                            )
+                            order_id = result.get("order", {}).get("order_id", "unknown")
+                            sys.stdout.write(f"\n[ORDER] YES BUY @ {ya} - 10 shares - Order ID: {order_id}\n")
+                            sys.stdout.flush()
+                        except Exception as e:
+                            sys.stdout.write(f"\n[ORDER ERROR] YES BUY failed: {e}\n")
+                            sys.stdout.flush()
+                    else:
+                        sys.stdout.write(f"\n[ORDER ERROR] YES ask price not available\n")
+                        sys.stdout.flush()
+                
+                elif char == 'w':
+                    # Buy NO at ask price
+                    async with book.lock:
+                        na = book.best_no_ask_implied()
+                    
+                    if na is not None:
+                        try:
+                            result = http_client.create_order(
+                                ticker=market_ticker,
+                                action="buy",
+                                side="no",
+                                count=10,
+                                no_price=na,
+                                order_type="limit"
+                            )
+                            order_id = result.get("order", {}).get("order_id", "unknown")
+                            sys.stdout.write(f"\n[ORDER] NO BUY @ {na} - 10 shares - Order ID: {order_id}\n")
+                            sys.stdout.flush()
+                        except Exception as e:
+                            sys.stdout.write(f"\n[ORDER ERROR] NO BUY failed: {e}\n")
+                            sys.stdout.flush()
+                    else:
+                        sys.stdout.write(f"\n[ORDER ERROR] NO ask price not available\n")
+                        sys.stdout.flush()
+                
+                elif char == '\x03':  # Ctrl+C
+                    break
+            
+            await asyncio.sleep(0.01)
+    finally:
+        # Restore terminal settings
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+
+
 async def run_stream(key_id: str, private_key, market_ticker: str):
     streamer = MarketDataStreamer(key_id=key_id, private_key=private_key, market_ticker=market_ticker)
     http_client = KalshiHttpClient(key_id=key_id, private_key=private_key)
@@ -353,6 +432,7 @@ async def run_stream(key_id: str, private_key, market_ticker: str):
     await asyncio.gather(
         streamer.connect(),
         print_tape_every_1ms(streamer.book, http_client),
+        keyboard_input_handler(streamer.book, http_client, market_ticker),
     )
 
 
