@@ -8,7 +8,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import Dict, Optional, List, Tuple
 
-from clients import KalshiWebSocketClient
+from clients import KalshiWebSocketClient, KalshiHttpClient
 import requests
 
 
@@ -238,16 +238,23 @@ def fmt_px(x: Optional[int]) -> str:
     return "---" if x is None else f"{x:02d}"
 
 
-async def print_tape_every_1ms(book: OrderBook):
+async def print_tape_every_1ms(book: OrderBook, http_client: KalshiHttpClient):
     """
-    Print a NEW line every 1ms with YES/NO bid+ask.
-    NOTE: 1000 lines/sec is very heavy on your terminal.
+    Print two updating lines every 1ms:
+    - Line 1: Price data with YES/NO bid+ask
+    - Line 2: Portfolio value
+    Uses ANSI escape codes to update both lines in place.
     """
     interval_ns = 1_000_000  # 1ms
     next_tick = time.perf_counter_ns()
-
-    buf = []
-    flush_every = 25  # flush more often so it *looks* realtime
+    last_price_line_length = 0
+    last_portfolio_line_length = 0
+    
+    # Portfolio value cache - update every 500ms to avoid rate limiting
+    portfolio_update_interval_ns = 500_000_000  # 500ms
+    next_portfolio_update = time.perf_counter_ns()
+    portfolio_value = "Loading..."
+    portfolio_line = "Portfolio: Loading..."
 
     while True:
         now = time.perf_counter_ns()
@@ -266,13 +273,41 @@ async def print_tape_every_1ms(book: OrderBook):
             nb = book.best_no_bid()
             na = book.best_no_ask_implied()
 
-        line = f"{tstr} | YES {fmt_px(yb)}/{fmt_px(ya)} || NO {fmt_px(nb)}/{fmt_px(na)}"
-        buf.append(line)
-
-        if len(buf) >= flush_every:
-            sys.stdout.write("\n".join(buf) + "\n")
-            sys.stdout.flush()
-            buf.clear()
+        price_line = f"{tstr} | YES {fmt_px(yb)}/{fmt_px(ya)} || NO {fmt_px(nb)}/{fmt_px(na)}"
+        
+        # Update portfolio value periodically (every 500ms)
+        if now >= next_portfolio_update:
+            try:
+                balance_data = http_client.get_balance()
+                # Extract balance - API returns value in cents, so divide by 100
+                balance = balance_data.get("balance", balance_data.get("portfolio_balance", "N/A"))
+                if isinstance(balance, (int, float)):
+                    balance_dollars = balance / 100.0
+                    portfolio_value = f"${balance_dollars:,.2f}"
+                else:
+                    portfolio_value = str(balance)
+                portfolio_line = f"Portfolio: {portfolio_value}"
+            except Exception as e:
+                portfolio_line = f"Portfolio: Error ({str(e)[:30]})"
+            next_portfolio_update = now + portfolio_update_interval_ns
+        
+        # Pad lines to clear any leftover characters
+        if len(price_line) < last_price_line_length:
+            price_line = price_line.ljust(last_price_line_length)
+        last_price_line_length = len(price_line)
+        
+        if len(portfolio_line) < last_portfolio_line_length:
+            portfolio_line = portfolio_line.ljust(last_portfolio_line_length)
+        last_portfolio_line_length = len(portfolio_line)
+        
+        # Use ANSI escape codes to update both lines:
+        # \033[2K = clear entire line
+        # \033[A = move cursor up one line
+        # \r = return to start of line
+        # Print both lines, then move up 1 to return to price line for next iteration
+        output = f"\033[2K\r{price_line}\n\033[2K\r{portfolio_line}\033[A"
+        sys.stdout.write(output)
+        sys.stdout.flush()
 
         next_tick += interval_ns
 
@@ -303,6 +338,7 @@ def seed_book_with_rest_snapshot(market_ticker: str) -> Tuple[List[List[int]], L
 
 async def run_stream(key_id: str, private_key, market_ticker: str):
     streamer = MarketDataStreamer(key_id=key_id, private_key=private_key, market_ticker=market_ticker)
+    http_client = KalshiHttpClient(key_id=key_id, private_key=private_key)
 
     # Seed from REST once (fast + confirms real liquidity)
     try:
@@ -316,7 +352,7 @@ async def run_stream(key_id: str, private_key, market_ticker: str):
 
     await asyncio.gather(
         streamer.connect(),
-        print_tape_every_1ms(streamer.book),
+        print_tape_every_1ms(streamer.book, http_client),
     )
 
 
