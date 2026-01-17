@@ -189,6 +189,21 @@ class KalshiHttpClient(KalshiBaseClient):
         
         return self.post(self.portfolio_url + '/orders', body)
 
+    def get_positions(self, ticker: Optional[str] = None) -> Dict[str, Any]:
+        """Retrieves portfolio positions."""
+        params = {}
+        if ticker:
+            params["ticker"] = ticker
+        return self.get(self.portfolio_url + '/positions', params=params)
+
+    def get_order(self, order_id: str) -> Dict[str, Any]:
+        """Retrieves a specific order by ID."""
+        return self.get(self.portfolio_url + f'/orders/{order_id}')
+
+    def cancel_order(self, order_id: str) -> Dict[str, Any]:
+        """Cancels a specific order by ID."""
+        return self.post(self.portfolio_url + f'/orders/{order_id}/cancel', {})
+
 
 class KalshiWebSocketClient(KalshiBaseClient):
     """Client for handling WebSocket connections to the Kalshi API."""

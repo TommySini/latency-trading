@@ -10,6 +10,7 @@ import termios
 import tty
 from dataclasses import dataclass, field
 from typing import Dict, Optional, List, Tuple
+from collections import defaultdict
 
 from clients import KalshiWebSocketClient, KalshiHttpClient
 import requests
@@ -117,6 +118,14 @@ class OrderBook:
         if self.best_yes is None:
             return None
         return 100 - self.best_yes
+
+    def best_yes_bid_direct(self) -> Optional[int]:
+        """Returns the best YES bid (for selling YES)."""
+        return self.best_yes
+
+    def best_no_bid_direct(self) -> Optional[int]:
+        """Returns the best NO bid (for selling NO)."""
+        return self.best_no
 
 
 # -----------------------------
@@ -339,7 +348,63 @@ def seed_book_with_rest_snapshot(market_ticker: str) -> Tuple[List[List[int]], L
     return (yes if isinstance(yes, list) else []), (no if isinstance(no, list) else [])
 
 
-async def keyboard_input_handler(book: OrderBook, http_client: KalshiHttpClient, market_ticker: str):
+# -----------------------------
+# Position Tracker
+# -----------------------------
+@dataclass
+class PositionEntry:
+    side: str  # "yes" or "no"
+    quantity: int
+    entry_time: float
+    buy_order_id: Optional[str] = None
+    sell_order_id: Optional[str] = None
+    liquidation_start_time: Optional[float] = None
+    current_sell_price: Optional[int] = None
+    last_bid_check_time: float = 0.0
+    escalated: bool = False
+
+
+class PositionTracker:
+    def __init__(self):
+        self.positions: Dict[str, PositionEntry] = {}  # key: side, value: PositionEntry
+        self.lock = asyncio.Lock()
+
+    async def register_buy_order(self, side: str, quantity: int, order_id: str):
+        """Register a buy order - will start liquidation 4s after entry."""
+        async with self.lock:
+            entry_time = time.time()
+            self.positions[side] = PositionEntry(
+                side=side,
+                quantity=quantity,
+                entry_time=entry_time,
+                buy_order_id=order_id,
+                last_bid_check_time=0.0,
+                escalated=False
+            )
+
+    async def get_position(self, side: str) -> Optional[PositionEntry]:
+        async with self.lock:
+            return self.positions.get(side)
+
+    async def clear_position(self, side: str):
+        async with self.lock:
+            if side in self.positions:
+                del self.positions[side]
+
+    async def update_sell_order(self, side: str, sell_order_id: str, sell_price: int):
+        async with self.lock:
+            if side in self.positions:
+                self.positions[side].sell_order_id = sell_order_id
+                self.positions[side].current_sell_price = sell_price
+                self.positions[side].last_bid_check_time = time.time()
+
+
+async def keyboard_input_handler(
+    book: OrderBook, 
+    http_client: KalshiHttpClient, 
+    market_ticker: str,
+    position_tracker: PositionTracker
+):
     """
     Handle keyboard input asynchronously:
     - 'q': Buy YES at ask price (10 shares)
@@ -372,6 +437,7 @@ async def keyboard_input_handler(book: OrderBook, http_client: KalshiHttpClient,
                                 order_type="limit"
                             )
                             order_id = result.get("order", {}).get("order_id", "unknown")
+                            await position_tracker.register_buy_order("yes", 10, order_id)
                             sys.stdout.write(f"\n[ORDER] YES BUY @ {ya} - 10 shares - Order ID: {order_id}\n")
                             sys.stdout.flush()
                         except Exception as e:
@@ -397,6 +463,7 @@ async def keyboard_input_handler(book: OrderBook, http_client: KalshiHttpClient,
                                 order_type="limit"
                             )
                             order_id = result.get("order", {}).get("order_id", "unknown")
+                            await position_tracker.register_buy_order("no", 10, order_id)
                             sys.stdout.write(f"\n[ORDER] NO BUY @ {na} - 10 shares - Order ID: {order_id}\n")
                             sys.stdout.flush()
                         except Exception as e:
@@ -415,9 +482,203 @@ async def keyboard_input_handler(book: OrderBook, http_client: KalshiHttpClient,
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
 
 
+async def liquidation_manager(
+    book: OrderBook,
+    http_client: KalshiHttpClient,
+    market_ticker: str,
+    position_tracker: PositionTracker
+):
+    """
+    Manages liquidation of positions:
+    - Starts 4 seconds after entry
+    - Places sell order at best bid
+    - Every 1s, checks if bid changed and cancels/replaces
+    - After 10s, cancels and places more aggressive order
+    """
+    while True:
+        await asyncio.sleep(0.1)  # Check every 100ms
+        
+        current_time = time.time()
+        
+        # Check each position
+        for side in ["yes", "no"]:
+            pos = await position_tracker.get_position(side)
+            if pos is None:
+                continue
+            
+            # Check if position is filled (simplified: assume filled after order placed)
+            # In production, you'd check order status via API
+            time_since_entry = current_time - pos.entry_time
+            
+            # Start liquidation 4 seconds after entry
+            if time_since_entry >= 4.0 and pos.liquidation_start_time is None:
+                pos.liquidation_start_time = current_time
+                
+                # Get best bid
+                async with book.lock:
+                    if side == "yes":
+                        bid = book.best_yes_bid_direct()
+                    else:
+                        bid = book.best_no_bid_direct()
+                
+                if bid is None:
+                    sys.stdout.write(f"\n[LIQUIDATION ERROR] {side.upper()} bid missing - panic stop\n")
+                    sys.stdout.flush()
+                    # Cancel all orders and exit
+                    if pos.sell_order_id:
+                        try:
+                            http_client.cancel_order(pos.sell_order_id)
+                        except:
+                            pass
+                    await position_tracker.clear_position(side)
+                    continue
+                
+                # Place initial sell order
+                try:
+                    result = http_client.create_order(
+                        ticker=market_ticker,
+                        action="sell",
+                        side=side,
+                        count=pos.quantity,
+                        yes_price=bid if side == "yes" else None,
+                        no_price=bid if side == "no" else None,
+                        order_type="limit"
+                    )
+                    sell_order_id = result.get("order", {}).get("order_id", "unknown")
+                    await position_tracker.update_sell_order(side, sell_order_id, bid)
+                    sys.stdout.write(f"\n[LIQUIDATION] {side.upper()} SELL @ {bid} - {pos.quantity} shares - Order ID: {sell_order_id}\n")
+                    sys.stdout.flush()
+                except Exception as e:
+                    sys.stdout.write(f"\n[LIQUIDATION ERROR] {side.upper()} SELL failed: {e}\n")
+                    sys.stdout.flush()
+            
+            # If liquidation has started, manage it
+            if pos.liquidation_start_time is not None:
+                liquidation_age = current_time - pos.liquidation_start_time
+                
+                # Check if position is flat by querying API (check every 2 seconds to avoid rate limiting)
+                if int(liquidation_age * 5) % 10 == 0:  # Every 2 seconds
+                    try:
+                        positions_data = http_client.get_positions(ticker=market_ticker)
+                        market_positions = positions_data.get("market_positions", [])
+                        current_position = 0
+                        for mp in market_positions:
+                            if mp.get("ticker") == market_ticker:
+                                # Position field: positive means long, negative means short
+                                # For YES side: we check if we have a YES position
+                                # For NO side: we check if we have a NO position
+                                # The API returns position as a single number, but we need to check
+                                # the actual position value. For simplicity, assume if position is 0, we're flat.
+                                current_position = mp.get("position", 0)
+                                break
+                        
+                        # If position is flat, exit
+                        if current_position == 0:
+                            sys.stdout.write(f"\n[LIQUIDATION] {side.upper()} position flat - liquidation complete\n")
+                            sys.stdout.flush()
+                            if pos.sell_order_id:
+                                try:
+                                    http_client.cancel_order(pos.sell_order_id)
+                                except:
+                                    pass
+                            await position_tracker.clear_position(side)
+                            continue
+                    except Exception as e:
+                        # If we can't check position, continue with liquidation logic
+                        pass
+                
+                # Bid adjustment walkdown loop - check every 1 second
+                if current_time - pos.last_bid_check_time >= 1.0:
+                    pos.last_bid_check_time = current_time
+                    
+                    # Get current bid
+                    async with book.lock:
+                        if side == "yes":
+                            bid_new = book.best_yes_bid_direct()
+                        else:
+                            bid_new = book.best_no_bid_direct()
+                    
+                    if bid_new is None:
+                        sys.stdout.write(f"\n[LIQUIDATION ERROR] {side.upper()} bid missing - panic stop\n")
+                        sys.stdout.flush()
+                        if pos.sell_order_id:
+                            try:
+                                http_client.cancel_order(pos.sell_order_id)
+                            except:
+                                pass
+                        await position_tracker.clear_position(side)
+                        continue
+                    
+                    # If bid changed, cancel and replace
+                    if bid_new != pos.current_sell_price:
+                        if pos.sell_order_id:
+                            try:
+                                http_client.cancel_order(pos.sell_order_id)
+                            except:
+                                pass
+                        
+                        # Place new sell order at new bid
+                        try:
+                            result = http_client.create_order(
+                                ticker=market_ticker,
+                                action="sell",
+                                side=side,
+                                count=pos.quantity,
+                                yes_price=bid_new if side == "yes" else None,
+                                no_price=bid_new if side == "no" else None,
+                                order_type="limit"
+                            )
+                            sell_order_id = result.get("order", {}).get("order_id", "unknown")
+                            await position_tracker.update_sell_order(side, sell_order_id, bid_new)
+                            sys.stdout.write(f"\n[LIQUIDATION] {side.upper()} REPRICE @ {bid_new} - Order ID: {sell_order_id}\n")
+                            sys.stdout.flush()
+                        except Exception as e:
+                            sys.stdout.write(f"\n[LIQUIDATION ERROR] {side.upper()} REPRICE failed: {e}\n")
+                            sys.stdout.flush()
+                
+                # After 10 seconds, escalate with more aggressive pricing (only once)
+                if liquidation_age >= 10.0 and not pos.escalated and pos.sell_order_id:
+                    pos.escalated = True
+                    
+                    # Cancel current sell order
+                    try:
+                        http_client.cancel_order(pos.sell_order_id)
+                    except:
+                        pass
+                    
+                    # Get current bid and subtract 0.02 (2 cents)
+                    async with book.lock:
+                        if side == "yes":
+                            bid_aggressive = book.best_yes_bid_direct()
+                        else:
+                            bid_aggressive = book.best_no_bid_direct()
+                    
+                    if bid_aggressive is not None:
+                        aggressive_price = max(1, bid_aggressive - 2)  # Subtract 2 cents, min 1
+                        
+                        try:
+                            result = http_client.create_order(
+                                ticker=market_ticker,
+                                action="sell",
+                                side=side,
+                                count=pos.quantity,
+                                yes_price=aggressive_price if side == "yes" else None,
+                                no_price=aggressive_price if side == "no" else None,
+                                order_type="limit"
+                            )
+                            sell_order_id = result.get("order", {}).get("order_id", "unknown")
+                            await position_tracker.update_sell_order(side, sell_order_id, aggressive_price)
+                            sys.stdout.write(f"\n[LIQUIDATION ESCALATE] {side.upper()} SELL @ {aggressive_price} (bid-2) - Order ID: {sell_order_id}\n")
+                            sys.stdout.flush()
+                        except Exception as e:
+                            sys.stdout.write(f"\n[LIQUIDATION ERROR] {side.upper()} ESCALATE failed: {e}\n")
+                            sys.stdout.flush()
+
+
 async def run_stream(key_id: str, private_key, market_ticker: str):
     streamer = MarketDataStreamer(key_id=key_id, private_key=private_key, market_ticker=market_ticker)
     http_client = KalshiHttpClient(key_id=key_id, private_key=private_key)
+    position_tracker = PositionTracker()
 
     # Seed from REST once (fast + confirms real liquidity)
     try:
@@ -432,7 +693,8 @@ async def run_stream(key_id: str, private_key, market_ticker: str):
     await asyncio.gather(
         streamer.connect(),
         print_tape_every_1ms(streamer.book, http_client),
-        keyboard_input_handler(streamer.book, http_client, market_ticker),
+        keyboard_input_handler(streamer.book, http_client, market_ticker, position_tracker),
+        liquidation_manager(streamer.book, http_client, market_ticker, position_tracker),
     )
 
 
