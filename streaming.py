@@ -9,7 +9,7 @@ import select
 import termios
 import tty
 from dataclasses import dataclass, field
-from typing import Dict, Optional, List, Tuple
+from typing import Dict, Optional, List, Tuple, Any
 from collections import defaultdict
 
 from clients import KalshiWebSocketClient, KalshiHttpClient
@@ -132,13 +132,15 @@ class OrderBook:
 # Websocket Streamer
 # -----------------------------
 class MarketDataStreamer(KalshiWebSocketClient):
-    def __init__(self, key_id: str, private_key, market_ticker: str):
+    def __init__(self, key_id: str, private_key, market_ticker: str, position_tracker: Optional[PositionTracker] = None):
         super().__init__(key_id=key_id, private_key=private_key)
         self.market_ticker = market_ticker
         self.book = OrderBook(market_ticker=market_ticker)
+        self.position_tracker = position_tracker
 
         self._cmd_id = 1
         self._orderbook_sid: Optional[int] = None  # IMPORTANT: subscription id for orderbook_delta
+        self._user_fills_sid: Optional[int] = None  # subscription id for user_fills
 
     def _next_cmd_id(self) -> int:
         cid = self._cmd_id
@@ -146,9 +148,15 @@ class MarketDataStreamer(KalshiWebSocketClient):
         return cid
 
     async def on_open(self):
-        await self._subscribe_clean()
+        await self._subscribe_orderbook()
 
-    async def _subscribe_clean(self):
+    async def _subscribe_orderbook(self):
+        """Subscribe to orderbook_delta for this market."""
+        if self.ws is None:
+            return
+        
+        await asyncio.sleep(0.2)  # Small delay after connection
+        
         cmd = {
             "id": self._next_cmd_id(),
             "cmd": "subscribe",
@@ -157,6 +165,8 @@ class MarketDataStreamer(KalshiWebSocketClient):
                 "market_ticker": self.market_ticker,
             },
         }
+        sys.stdout.write(f"\n[WS] Subscribing to orderbook_delta: {json.dumps(cmd)}\n")
+        sys.stdout.flush()
         await self.ws.send(json.dumps(cmd))
 
     async def _unsubscribe_orderbook(self):
@@ -179,30 +189,171 @@ class MarketDataStreamer(KalshiWebSocketClient):
         sys.stdout.write("\n[RESYNC] Unsubscribing + resubscribing orderbook...\n")
         sys.stdout.flush()
         await self._unsubscribe_orderbook()
-        await self._subscribe_clean()
+        await self._subscribe_orderbook()
+    
+    async def on_fill(self, fill_msg: Dict[str, Any]):
+        """Override base class on_fill to handle fills with position tracker."""
+        if self.position_tracker is None:
+            return
+        
+        market_ticker = fill_msg.get("market_ticker")
+        # Only process fills for our market
+        if market_ticker != self.market_ticker:
+            return
+        
+        action = fill_msg.get("action")  # "buy" or "sell"
+        side = fill_msg.get("side")  # "yes" or "no"
+        order_id = fill_msg.get("order_id")
+        count = fill_msg.get("count", 0)  # quantity filled
+        
+        if not action or not side:
+            sys.stdout.write(f"\n[FILL ERROR] Missing action or side: action={action}, side={side}\n")
+            sys.stdout.flush()
+            return
+        
+        if action == "buy":
+            # Buy fill - register position and start 4-second timer
+            await self.position_tracker.register_filled_position(side, count, order_id)
+            sys.stdout.write(f"\n[FILL] {side.upper()} BUY - {count} shares filled - Order ID: {order_id}\n")
+            sys.stdout.flush()
+        elif action == "sell":
+            # Sell fill - clear position (stop liquidation)
+            pos = await self.position_tracker.get_position(side)
+            if pos is not None:
+                sys.stdout.write(f"\n[FILL] {side.upper()} SELL - {count} shares filled - Order ID: {order_id} - Position liquidated\n")
+                sys.stdout.flush()
+                await self.position_tracker.clear_position(side)
+            else:
+                sys.stdout.write(f"\n[FILL] {side.upper()} SELL - {count} shares filled - Order ID: {order_id} - No position found to clear\n")
+                sys.stdout.flush()
 
-    async def on_message(self, message: str):
+    async def process_message(self, message: str):
+        """Override to handle orderbook messages, then call super for fills."""
         try:
             data = json.loads(message)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            sys.stdout.write(f"\n[WS JSON ERROR] Failed to parse message: {message[:200]}, error: {e}\n")
+            sys.stdout.flush()
             return
 
         msg_type = data.get("type")
+        
+        # Handle orderbook messages
+        if msg_type == "orderbook_snapshot":
+            sid = data.get("sid")
+            seq = data.get("seq")
+            msg = data.get("msg", {})
+            if msg.get("market_ticker") == self.market_ticker:
+                await self.book.apply_snapshot(
+                    yes=msg.get("yes", []),
+                    no=msg.get("no", []),
+                    sid=sid,
+                    seq=seq,
+                )
+            return
+        
+        if msg_type == "orderbook_delta":
+            sid = data.get("sid")
+            seq = data.get("seq")
+            msg = data.get("msg", {})
+            if msg.get("market_ticker") == self.market_ticker:
+                ok = await self.book.apply_delta(
+                    side=msg["side"],
+                    price=int(msg["price"]),
+                    delta=int(msg["delta"]),
+                    sid=sid,
+                    seq=seq,
+                )
+                if not ok:
+                    await self._resync()
+            return
+        
+        # Handle subscription confirmations
+        if msg_type == "subscribed":
+            msg = data.get("msg", {})
+            channel = msg.get("channel")
+            if channel == "orderbook_delta":
+                self._orderbook_sid = msg.get("sid")
+                sys.stdout.write(f"\n[WS] Subscribed to orderbook_delta, sid={self._orderbook_sid}\n")
+                sys.stdout.flush()
+            return
+        
+        if msg_type == "ok":
+            subs = data.get("subscriptions", [])
+            for s in subs:
+                channel = s.get("channel")
+                sid = s.get("sid")
+                if channel == "orderbook_delta":
+                    self._orderbook_sid = sid
+                    sys.stdout.write(f"\n[WS] Subscribed to orderbook_delta, sid={self._orderbook_sid}\n")
+                    sys.stdout.flush()
+            return
+        
+        # For all other messages (including fills), call parent process_message
+        await super().process_message(message)
 
         # Subscription confirmation includes sids per channel
         if msg_type == "ok":
             subs = data.get("subscriptions", [])
+            
+            # #region agent log
+            with open('/Users/tommasosini/Desktop/latency-trading/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps({"sessionId":"debug-session","runId":"run2","hypothesisId":"G","location":"streaming.py:295","message":"Received ok message with subscriptions","data":{"subscriptions":subs,"full_data":data},"timestamp":int(time.time()*1000)}) + '\n')
+            # #endregion
+            
             for s in subs:
-                if s.get("channel") == "orderbook_delta":
-                    self._orderbook_sid = s.get("sid")
+                channel = s.get("channel")
+                sid = s.get("sid")
+                if channel == "orderbook_delta":
+                    self._orderbook_sid = sid
+                    sys.stdout.write(f"\n[WS] Subscribed to orderbook_delta, sid={self._orderbook_sid}\n")
+                    sys.stdout.flush()
+                elif channel == "user_fills":
+                    self._user_fills_sid = sid
+                    sys.stdout.write(f"\n[WS] ✓ Successfully subscribed to user_fills, sid={self._user_fills_sid}\n")
+                    sys.stdout.flush()
+                    
+                    # #region agent log
+                    with open('/Users/tommasosini/Desktop/latency-trading/.cursor/debug.log', 'a') as f:
+                        f.write(json.dumps({"sessionId":"debug-session","runId":"run2","hypothesisId":"G","location":"streaming.py:305","message":"user_fills subscription confirmed","data":{"sid":sid},"timestamp":int(time.time()*1000)}) + '\n')
+                    # #endregion
             return
 
-        if msg_type in {"subscribed"}:
+        # Hypothesis C: Maybe "subscribed" message type contains subscription info
+        if msg_type == "subscribed":
+            # #region agent log
+            with open('/Users/tommasosini/Desktop/latency-trading/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps({"sessionId":"debug-session","runId":"run2","hypothesisId":"C","location":"streaming.py:315","message":"Received subscribed message","data":{"full_data":data},"timestamp":int(time.time()*1000)}) + '\n')
+            # #endregion
+            # Check if this contains subscription info
+            msg = data.get("msg", {})
+            channel = msg.get("channel")
+            if channel:
+                sys.stdout.write(f"\n[WS] Subscribed message for channel: {channel}, sid: {msg.get('sid')}\n")
+                sys.stdout.flush()
+                if channel == "user_fills":
+                    self._user_fills_sid = msg.get("sid")
+                    sys.stdout.write(f"\n[WS] ✓ Successfully subscribed to user_fills via 'subscribed' message, sid={self._user_fills_sid}\n")
+                    sys.stdout.flush()
+                    
+                    # #region agent log
+                    with open('/Users/tommasosini/Desktop/latency-trading/.cursor/debug.log', 'a') as f:
+                        f.write(json.dumps({"sessionId":"debug-session","runId":"run2","hypothesisId":"C","location":"streaming.py:325","message":"user_fills subscription confirmed via subscribed message","data":{"sid":self._user_fills_sid},"timestamp":int(time.time()*1000)}) + '\n')
+                    # #endregion
             return
 
         if msg_type == "error":
-            sys.stdout.write("\n[WS ERROR] " + json.dumps(data) + "\n")
+            error_msg = data.get("msg", {})
+            error_code = error_msg.get("code")
+            error_text = error_msg.get("msg")
+            request_id = data.get("id")
+            sys.stdout.write(f"\n[WS ERROR] Request ID: {request_id}, Code: {error_code}, Message: {error_text}, Full: {json.dumps(data)}\n")
             sys.stdout.flush()
+            
+            # #region agent log
+            with open('/Users/tommasosini/Desktop/latency-trading/.cursor/debug.log', 'a') as f:
+                f.write(json.dumps({"sessionId":"debug-session","runId":"run2","hypothesisId":"G","location":"streaming.py:335","message":"WebSocket error received","data":{"request_id":request_id,"error_code":error_code,"error_text":error_text,"full_data":data},"timestamp":int(time.time()*1000)}) + '\n')
+            # #endregion
             return
 
         if msg_type == "orderbook_snapshot":
@@ -241,6 +392,7 @@ class MarketDataStreamer(KalshiWebSocketClient):
                 # IMPORTANT: gap -> clean resync
                 await self._resync()
             return
+
 
 
 # -----------------------------
@@ -352,6 +504,14 @@ def seed_book_with_rest_snapshot(market_ticker: str) -> Tuple[List[List[int]], L
 # Position Tracker
 # -----------------------------
 @dataclass
+class PendingBuyOrder:
+    side: str  # "yes" or "no"
+    quantity: int
+    order_id: str
+    placed_time: float
+
+
+@dataclass
 class PositionEntry:
     side: str  # "yes" or "no"
     quantity: int
@@ -367,10 +527,21 @@ class PositionEntry:
 class PositionTracker:
     def __init__(self):
         self.positions: Dict[str, PositionEntry] = {}  # key: side, value: PositionEntry
+        self.pending_orders: Dict[str, PendingBuyOrder] = {}  # key: order_id, value: PendingBuyOrder
         self.lock = asyncio.Lock()
 
-    async def register_buy_order(self, side: str, quantity: int, order_id: str):
-        """Register a buy order - will start liquidation 4s after entry."""
+    async def register_pending_buy_order(self, side: str, quantity: int, order_id: str):
+        """Register a pending buy order - will check if filled and register position when filled."""
+        async with self.lock:
+            self.pending_orders[order_id] = PendingBuyOrder(
+                side=side,
+                quantity=quantity,
+                order_id=order_id,
+                placed_time=time.time()
+            )
+
+    async def register_filled_position(self, side: str, quantity: int, order_id: str):
+        """Register a position when buy order is filled - starts liquidation timer."""
         async with self.lock:
             entry_time = time.time()
             self.positions[side] = PositionEntry(
@@ -381,10 +552,24 @@ class PositionTracker:
                 last_bid_check_time=0.0,
                 escalated=False
             )
+            # Remove from pending orders
+            if order_id in self.pending_orders:
+                del self.pending_orders[order_id]
 
     async def get_position(self, side: str) -> Optional[PositionEntry]:
         async with self.lock:
             return self.positions.get(side)
+
+    async def get_pending_orders(self) -> List[PendingBuyOrder]:
+        """Get all pending buy orders."""
+        async with self.lock:
+            return list(self.pending_orders.values())
+
+    async def remove_pending_order(self, order_id: str):
+        """Remove a pending order."""
+        async with self.lock:
+            if order_id in self.pending_orders:
+                del self.pending_orders[order_id]
 
     async def clear_position(self, side: str):
         async with self.lock:
@@ -397,6 +582,25 @@ class PositionTracker:
                 self.positions[side].sell_order_id = sell_order_id
                 self.positions[side].current_sell_price = sell_price
                 self.positions[side].last_bid_check_time = time.time()
+    
+    async def start_liquidation(self, side: str, start_time: float):
+        """Start liquidation for a position."""
+        async with self.lock:
+            if side in self.positions:
+                self.positions[side].liquidation_start_time = start_time
+                self.positions[side].last_bid_check_time = start_time
+    
+    async def update_bid_check_time(self, side: str, check_time: float):
+        """Update the last bid check time."""
+        async with self.lock:
+            if side in self.positions:
+                self.positions[side].last_bid_check_time = check_time
+    
+    async def mark_escalated(self, side: str):
+        """Mark position as escalated."""
+        async with self.lock:
+            if side in self.positions:
+                self.positions[side].escalated = True
 
 
 async def keyboard_input_handler(
@@ -444,7 +648,7 @@ async def keyboard_input_handler(
                                 order_type="limit"
                             )
                             order_id = result.get("order", {}).get("order_id", "unknown")
-                            await position_tracker.register_buy_order("yes", 5, order_id)
+                            await position_tracker.register_pending_buy_order("yes", 5, order_id)
                             sys.stdout.write(f"\n[ORDER] YES BUY @ {ya} - 5 shares - Order ID: {order_id}\n")
                             sys.stdout.flush()
                         except Exception as e:
@@ -477,7 +681,7 @@ async def keyboard_input_handler(
                                 order_type="limit"
                             )
                             order_id = result.get("order", {}).get("order_id", "unknown")
-                            await position_tracker.register_buy_order("no", 5, order_id)
+                            await position_tracker.register_pending_buy_order("no", 5, order_id)
                             sys.stdout.write(f"\n[ORDER] NO BUY @ {na} - 5 shares - Order ID: {order_id}\n")
                             sys.stdout.flush()
                         except Exception as e:
@@ -496,6 +700,10 @@ async def keyboard_input_handler(
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
 
 
+
+
+
+
 async def liquidation_manager(
     book: OrderBook,
     http_client: KalshiHttpClient,
@@ -503,11 +711,11 @@ async def liquidation_manager(
     position_tracker: PositionTracker
 ):
     """
-    Manages liquidation of positions:
+    Manages liquidation of positions following exact specification:
     - Starts 4 seconds after entry
-    - Places sell order at best bid
-    - Every 1s, checks if bid changed and cancels/replaces
-    - After 10s, cancels and places more aggressive order
+    - Places sell order at best bid (bid₀)
+    - Every 1s: checks if position flat, then checks if bid changed and cancels/replaces
+    - After 10s: escalates with bid - 0.02
     """
     while True:
         await asyncio.sleep(0.1)  # Check every 100ms
@@ -520,25 +728,29 @@ async def liquidation_manager(
             if pos is None:
                 continue
             
-            # Check if position is filled (simplified: assume filled after order placed)
-            # In production, you'd check order status via API
             time_since_entry = current_time - pos.entry_time
             
-            # Start liquidation 4 seconds after entry
+            # Start liquidation 4 seconds after entry (entry_time is set when buy fill is received)
             if time_since_entry >= 4.0 and pos.liquidation_start_time is None:
-                pos.liquidation_start_time = current_time
+                sys.stdout.write(f"\n[LIQUIDATION] Starting liquidation for {side.upper()} position after {time_since_entry:.2f}s\n")
+                sys.stdout.flush()
+                await position_tracker.start_liquidation(side, current_time)
+                # Re-fetch position to get updated values
+                pos = await position_tracker.get_position(side)
+                if pos is None:
+                    continue
                 
-                # Get best bid
+                # Get best bid (bid₀) - the lower of the two numbers in the spread
                 async with book.lock:
                     if side == "yes":
                         bid = book.best_yes_bid_direct()
                     else:
                         bid = book.best_no_bid_direct()
                 
+                # If bid missing / market halted → panic stop
                 if bid is None:
                     sys.stdout.write(f"\n[LIQUIDATION ERROR] {side.upper()} bid missing - panic stop\n")
                     sys.stdout.flush()
-                    # Cancel all orders and exit
                     if pos.sell_order_id:
                         try:
                             http_client.cancel_order(pos.sell_order_id)
@@ -547,7 +759,7 @@ async def liquidation_manager(
                     await position_tracker.clear_position(side)
                     continue
                 
-                # Place initial sell order
+                # Submit LIMIT SELL: price = bid₀, quantity = filled_qty
                 try:
                     result = http_client.create_order(
                         ticker=market_ticker,
@@ -565,53 +777,29 @@ async def liquidation_manager(
                 except Exception as e:
                     sys.stdout.write(f"\n[LIQUIDATION ERROR] {side.upper()} SELL failed: {e}\n")
                     sys.stdout.flush()
+                    continue
             
-            # If liquidation has started, manage it
+            # Bid Adjustment Walkdown Loop - Every 1s
             if pos.liquidation_start_time is not None:
                 liquidation_age = current_time - pos.liquidation_start_time
                 
-                # Check if position is flat by querying API (check every 2 seconds to avoid rate limiting)
-                if int(liquidation_age * 5) % 10 == 0:  # Every 2 seconds
-                    try:
-                        positions_data = http_client.get_positions(ticker=market_ticker)
-                        market_positions = positions_data.get("market_positions", [])
-                        current_position = 0
-                        for mp in market_positions:
-                            if mp.get("ticker") == market_ticker:
-                                # Position field: positive means long, negative means short
-                                # For YES side: we check if we have a YES position
-                                # For NO side: we check if we have a NO position
-                                # The API returns position as a single number, but we need to check
-                                # the actual position value. For simplicity, assume if position is 0, we're flat.
-                                current_position = mp.get("position", 0)
-                                break
-                        
-                        # If position is flat, exit
-                        if current_position == 0:
-                            sys.stdout.write(f"\n[LIQUIDATION] {side.upper()} position flat - liquidation complete\n")
-                            sys.stdout.flush()
-                            if pos.sell_order_id:
-                                try:
-                                    http_client.cancel_order(pos.sell_order_id)
-                                except:
-                                    pass
-                            await position_tracker.clear_position(side)
-                            continue
-                    except Exception as e:
-                        # If we can't check position, continue with liquidation logic
-                        pass
-                
-                # Bid adjustment walkdown loop - check every 1 second
+                # Check every 1 second
                 if current_time - pos.last_bid_check_time >= 1.0:
-                    pos.last_bid_check_time = current_time
+                    await position_tracker.update_bid_check_time(side, current_time)
+                    # Re-fetch position to get updated values
+                    pos = await position_tracker.get_position(side)
+                    if pos is None:
+                        # Position was cleared (likely by sell fill) - exit flow complete
+                        continue
                     
-                    # Get current bid
+                    # Read bid_new
                     async with book.lock:
                         if side == "yes":
                             bid_new = book.best_yes_bid_direct()
                         else:
                             bid_new = book.best_no_bid_direct()
                     
+                    # If bid missing / halted → panic stop
                     if bid_new is None:
                         sys.stdout.write(f"\n[LIQUIDATION ERROR] {side.upper()} bid missing - panic stop\n")
                         sys.stdout.flush()
@@ -623,7 +811,7 @@ async def liquidation_manager(
                         await position_tracker.clear_position(side)
                         continue
                     
-                    # If bid changed, cancel and replace
+                    # If bid_new ≠ current_price → cancel/replace sell at bid_new
                     if bid_new != pos.current_sell_price:
                         if pos.sell_order_id:
                             try:
@@ -650,49 +838,59 @@ async def liquidation_manager(
                             sys.stdout.write(f"\n[LIQUIDATION ERROR] {side.upper()} REPRICE failed: {e}\n")
                             sys.stdout.flush()
                 
-                # After 10 seconds, escalate with more aggressive pricing (only once)
+                # Exit Timeout Escalation - If still not fully liquidated 10.0s after liquidation start
                 if liquidation_age >= 10.0 and not pos.escalated and pos.sell_order_id:
-                    pos.escalated = True
+                    await position_tracker.mark_escalated(side)
+                    # Re-fetch position to get updated values
+                    pos = await position_tracker.get_position(side)
+                    if pos is None:
+                        continue
                     
-                    # Cancel current sell order
+                    # Cancel resting sell
                     try:
                         http_client.cancel_order(pos.sell_order_id)
                     except:
                         pass
                     
-                    # Get current bid and subtract 0.02 (2 cents)
+                    # Get current bid
                     async with book.lock:
                         if side == "yes":
                             bid_aggressive = book.best_yes_bid_direct()
                         else:
                             bid_aggressive = book.best_no_bid_direct()
                     
-                    if bid_aggressive is not None:
-                        aggressive_price = max(1, bid_aggressive - 2)  # Subtract 2 cents, min 1
-                        
-                        try:
-                            result = http_client.create_order(
-                                ticker=market_ticker,
-                                action="sell",
-                                side=side,
-                                count=pos.quantity,
-                                yes_price=aggressive_price if side == "yes" else None,
-                                no_price=aggressive_price if side == "no" else None,
-                                order_type="limit"
-                            )
-                            sell_order_id = result.get("order", {}).get("order_id", "unknown")
-                            await position_tracker.update_sell_order(side, sell_order_id, aggressive_price)
-                            sys.stdout.write(f"\n[LIQUIDATION ESCALATE] {side.upper()} SELL @ {aggressive_price} (bid-2) - Order ID: {sell_order_id}\n")
-                            sys.stdout.flush()
-                        except Exception as e:
-                            sys.stdout.write(f"\n[LIQUIDATION ERROR] {side.upper()} ESCALATE failed: {e}\n")
-                            sys.stdout.flush()
+                    if bid_aggressive is None:
+                        sys.stdout.write(f"\n[LIQUIDATION ERROR] {side.upper()} bid missing during escalation - panic stop\n")
+                        sys.stdout.flush()
+                        await position_tracker.clear_position(side)
+                        continue
+                    
+                    # Submit more aggressive LIMIT SELL at: price = best_bid − 0.02
+                    aggressive_price = max(1, bid_aggressive - 2)  # Subtract 2 cents (0.02), min 1
+                    
+                    try:
+                        result = http_client.create_order(
+                            ticker=market_ticker,
+                            action="sell",
+                            side=side,
+                            count=pos.quantity,
+                            yes_price=aggressive_price if side == "yes" else None,
+                            no_price=aggressive_price if side == "no" else None,
+                            order_type="limit"
+                        )
+                        sell_order_id = result.get("order", {}).get("order_id", "unknown")
+                        await position_tracker.update_sell_order(side, sell_order_id, aggressive_price)
+                        sys.stdout.write(f"\n[LIQUIDATION ESCALATE] {side.upper()} SELL @ {aggressive_price} (bid-2) - Order ID: {sell_order_id}\n")
+                        sys.stdout.flush()
+                    except Exception as e:
+                        sys.stdout.write(f"\n[LIQUIDATION ERROR] {side.upper()} ESCALATE failed: {e}\n")
+                        sys.stdout.flush()
 
 
 async def run_stream(key_id: str, private_key, market_ticker: str):
-    streamer = MarketDataStreamer(key_id=key_id, private_key=private_key, market_ticker=market_ticker)
     http_client = KalshiHttpClient(key_id=key_id, private_key=private_key)
     position_tracker = PositionTracker()
+    streamer = MarketDataStreamer(key_id=key_id, private_key=private_key, market_ticker=market_ticker, position_tracker=position_tracker)
 
     # Seed from REST once (fast + confirms real liquidity)
     try:

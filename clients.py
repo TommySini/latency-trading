@@ -215,39 +215,157 @@ class KalshiWebSocketClient(KalshiBaseClient):
         super().__init__(key_id, private_key)
         self.ws = None
         self.url_suffix = "/trade-api/ws/v2"
+        self._msg_id = 1
+        self._fill_subscribed = False
+
+    def _next_msg_id(self) -> int:
+        """Get next message ID for WebSocket commands."""
+        msg_id = self._msg_id
+        self._msg_id += 1
+        return msg_id
+
+    def _get_ws_auth_headers(self) -> Dict[str, str]:
+        """Generate WebSocket authentication headers.
+        
+        The signed text must be: timestamp + "GET" + "/trade-api/ws/v2"
+        """
+        current_time_milliseconds = int(time.time() * 1000)
+        timestamp_str = str(current_time_milliseconds)
+        
+        # Sign: timestamp + "GET" + "/trade-api/ws/v2"
+        msg_string = timestamp_str + "GET" + self.url_suffix
+        signature = self.sign_pss_text(msg_string)
+        
+        headers = {
+            "KALSHI-ACCESS-KEY": self.key_id,
+            "KALSHI-ACCESS-SIGNATURE": signature,
+            "KALSHI-ACCESS-TIMESTAMP": timestamp_str,
+        }
+        return headers
+
+    async def subscribe_user_fills(self):
+        """Subscribe to the User Fills channel.
+        
+        Per Kalshi docs: market specification is ignored, always sends all fills.
+        Channel name is "fill" (not "user_fills").
+        """
+        if self.ws is None:
+            raise RuntimeError("WebSocket not connected")
+        
+        cmd = {
+            "id": self._next_msg_id(),
+            "cmd": "subscribe",
+            "params": {
+                "channels": ["fill"]
+            }
+        }
+        
+        await self.ws.send(json.dumps(cmd))
+        print(f"[WS] Subscribed to fill channel: {json.dumps(cmd)}")
 
     async def connect(self):
-        """Establishes a WebSocket connection using authentication."""
+        """Establishes a WebSocket connection and processes messages continuously."""
         host = self.WS_BASE_URL + self.url_suffix
-        auth_headers = self.request_headers("GET", self.url_suffix)
+        auth_headers = self._get_ws_auth_headers()
+        
         ssl_context = ssl.create_default_context(cafile=certifi.where())
-        async with websockets.connect(host, additional_headers=auth_headers, ssl=ssl_context) as websocket:
+        async with websockets.connect(
+            host,
+            additional_headers=auth_headers,
+            ssl=ssl_context,
+            ping_interval=20,
+            ping_timeout=10
+        ) as websocket:
             self.ws = websocket
             await self.on_open()
-            await self.handler()
+            
+            # Subscribe to fill channel
+            await self.subscribe_user_fills()
+            
+            # Process messages continuously
+            try:
+                async for message in websocket:
+                    await self.process_message(message)
+            except websockets.ConnectionClosed as e:
+                await self.on_close(e.code, e.reason)
+            except Exception as e:
+                await self.on_error(e)
+
+    async def process_message(self, message: str):
+        """Process incoming WebSocket messages."""
+        try:
+            data = json.loads(message)
+        except json.JSONDecodeError as e:
+            print(f"[WS] Failed to parse message: {e}, message: {message[:200]}")
+            return
+        
+        msg_type = data.get("type")
+        
+        if msg_type == "fill":
+            # User fill notification
+            fill_msg = data.get("msg", {})
+            await self.on_fill(fill_msg)
+        elif msg_type == "error":
+            # Error message
+            error_data = data.get("msg", {})
+            error_code = error_data.get("code")
+            error_msg = error_data.get("msg")
+            print(f"[WS ERROR] Code: {error_code}, Message: {error_msg}")
+            await self.on_error(f"WebSocket error {error_code}: {error_msg}")
+        elif msg_type == "subscribed":
+            # Subscription confirmation
+            sub_msg = data.get("msg", {})
+            channel = sub_msg.get("channel")
+            sid = sub_msg.get("sid")
+            print(f"[WS] Subscribed to channel: {channel}, sid: {sid}")
+            if channel == "fill":
+                self._fill_subscribed = True
+        elif msg_type == "ok":
+            # OK response (may contain subscription info)
+            subs = data.get("subscriptions", [])
+            for sub in subs:
+                channel = sub.get("channel")
+                sid = sub.get("sid")
+                print(f"[WS] Subscription confirmed: {channel}, sid: {sid}")
+                if channel == "fill":
+                    self._fill_subscribed = True
+        else:
+            # Other message types - pass to on_message for custom handling
+            await self.on_message(data)
 
     async def on_open(self):
         """Callback when WebSocket connection is opened."""
         print("WebSocket connection opened.")
 
-    async def handler(self):
-        """Handle incoming messages."""
-        try:
-            async for message in self.ws:
-                await self.on_message(message)
-        except websockets.ConnectionClosed as e:
-            await self.on_close(e.code, e.reason)
-        except Exception as e:
-            await self.on_error(e)
+    async def on_fill(self, fill_msg: Dict[str, Any]):
+        """Callback for handling fill notifications.
+        
+        Args:
+            fill_msg: The fill message payload containing:
+                - trade_id: str
+                - order_id: str
+                - market_ticker: str
+                - is_taker: bool
+                - side: "yes" or "no"
+                - yes_price: int (or no_price)
+                - count: int
+                - action: "buy" or "sell"
+                - ts: int (timestamp)
+                - post_position: int
+        """
+        print(f"[WS FILL] {fill_msg.get('action', 'unknown').upper()} {fill_msg.get('side', 'unknown').upper()} "
+              f"- {fill_msg.get('count', 0)} shares @ {fill_msg.get('yes_price', fill_msg.get('no_price', 'N/A'))} "
+              f"- Order: {fill_msg.get('order_id', 'unknown')}")
 
     async def on_message(self, message):
-        """Callback for handling incoming messages."""
-        print("Received message:", message)
+        """Callback for handling other incoming messages."""
+        # Override this in subclasses for custom message handling
+        pass
 
     async def on_error(self, error):
         """Callback for handling errors."""
-        print("WebSocket error:", error)
+        print(f"WebSocket error: {error}")
 
     async def on_close(self, close_status_code, close_msg):
         """Callback when WebSocket connection is closed."""
-        print("WebSocket connection closed with code:", close_status_code, "and message:", close_msg)
+        print(f"WebSocket connection closed with code: {close_status_code}, message: {close_msg}")
