@@ -422,6 +422,13 @@ async def keyboard_input_handler(
                 char = sys.stdin.read(1)
                 
                 if char == 'q':
+                    # Check if YES position already exists - prevent new order if not liquidated
+                    existing_pos = await position_tracker.get_position("yes")
+                    if existing_pos is not None:
+                        sys.stdout.write(f"\n[ORDER ERROR] YES position already exists - cannot place new buy until liquidated\n")
+                        sys.stdout.flush()
+                        continue
+                    
                     # Buy YES at ask price
                     async with book.lock:
                         ya = book.best_yes_ask_implied()
@@ -432,13 +439,13 @@ async def keyboard_input_handler(
                                 ticker=market_ticker,
                                 action="buy",
                                 side="yes",
-                                count=10,
+                                count=5,
                                 yes_price=ya,
                                 order_type="limit"
                             )
                             order_id = result.get("order", {}).get("order_id", "unknown")
-                            await position_tracker.register_buy_order("yes", 10, order_id)
-                            sys.stdout.write(f"\n[ORDER] YES BUY @ {ya} - 10 shares - Order ID: {order_id}\n")
+                            await position_tracker.register_buy_order("yes", 5, order_id)
+                            sys.stdout.write(f"\n[ORDER] YES BUY @ {ya} - 5 shares - Order ID: {order_id}\n")
                             sys.stdout.flush()
                         except Exception as e:
                             sys.stdout.write(f"\n[ORDER ERROR] YES BUY failed: {e}\n")
@@ -448,6 +455,13 @@ async def keyboard_input_handler(
                         sys.stdout.flush()
                 
                 elif char == 'w':
+                    # Check if NO position already exists - prevent new order if not liquidated
+                    existing_pos = await position_tracker.get_position("no")
+                    if existing_pos is not None:
+                        sys.stdout.write(f"\n[ORDER ERROR] NO position already exists - cannot place new buy until liquidated\n")
+                        sys.stdout.flush()
+                        continue
+                    
                     # Buy NO at ask price
                     async with book.lock:
                         na = book.best_no_ask_implied()
@@ -458,13 +472,13 @@ async def keyboard_input_handler(
                                 ticker=market_ticker,
                                 action="buy",
                                 side="no",
-                                count=10,
+                                count=5,
                                 no_price=na,
                                 order_type="limit"
                             )
                             order_id = result.get("order", {}).get("order_id", "unknown")
-                            await position_tracker.register_buy_order("no", 10, order_id)
-                            sys.stdout.write(f"\n[ORDER] NO BUY @ {na} - 10 shares - Order ID: {order_id}\n")
+                            await position_tracker.register_buy_order("no", 5, order_id)
+                            sys.stdout.write(f"\n[ORDER] NO BUY @ {na} - 5 shares - Order ID: {order_id}\n")
                             sys.stdout.flush()
                         except Exception as e:
                             sys.stdout.write(f"\n[ORDER ERROR] NO BUY failed: {e}\n")
