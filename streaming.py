@@ -212,20 +212,24 @@ class MarketDataStreamer(KalshiWebSocketClient):
             return
         
         if action == "buy":
-            # Buy fill - register position and start 4-second timer
+            # Buy fill - register/augment position; supports partial fills accumulating
             await self.position_tracker.register_filled_position(side, count, order_id)
             sys.stdout.write(f"\n[FILL] {side.upper()} BUY - {count} shares filled - Order ID: {order_id}\n")
             sys.stdout.flush()
         elif action == "sell":
-            # Sell fill - clear position (stop liquidation)
-            pos = await self.position_tracker.get_position(side)
-            if pos is not None:
-                sys.stdout.write(f"\n[FILL] {side.upper()} SELL - {count} shares filled - Order ID: {order_id} - Position liquidated\n")
-                sys.stdout.flush()
-                await self.position_tracker.clear_position(side)
+            # Sell fill - decrement position quantity; supports partial fills
+            remaining = await self.position_tracker.apply_sell_fill(side, count)
+            if remaining > 0:
+                sys.stdout.write(
+                    f"\n[FILL] {side.upper()} SELL - {count} shares filled - "
+                    f"Order ID: {order_id} - Remaining position: {remaining}\n"
+                )
             else:
-                sys.stdout.write(f"\n[FILL] {side.upper()} SELL - {count} shares filled - Order ID: {order_id} - No position found to clear\n")
-                sys.stdout.flush()
+                sys.stdout.write(
+                    f"\n[FILL] {side.upper()} SELL - {count} shares filled - "
+                    f"Order ID: {order_id} - Position fully liquidated\n"
+                )
+            sys.stdout.flush()
 
     async def process_message(self, message: str):
         """Override to handle orderbook messages, then call super for fills."""
@@ -503,7 +507,7 @@ def seed_book_with_rest_snapshot(market_ticker: str) -> Tuple[List[List[int]], L
 # -----------------------------
 # Position Sizing Configuration
 # -----------------------------
-POSITION_PCT = 0.25  # % of portfolio to trade
+POSITION_PCT = 0.005  # % of portfolio to trade
 
 
 def compute_shares_from_budget(target_usd: float, price_cents: int) -> Optional[int]:
@@ -594,20 +598,32 @@ class PositionTracker:
                 order_id=order_id,
                 placed_time=time.time()
             )
-
+    
     async def register_filled_position(self, side: str, quantity: int, order_id: str):
-        """Register a position when buy order is filled - starts liquidation timer."""
+        """
+        Register a position when a buy order is filled.
+        
+        Supports partial fills by:
+        - Creating a new PositionEntry if none exists.
+        - Incrementing quantity on an existing position without resetting timers.
+        """
         async with self.lock:
-            entry_time = time.time()
-            self.positions[side] = PositionEntry(
-                side=side,
-                quantity=quantity,
-                entry_time=entry_time,
-                buy_order_id=order_id,
-                last_bid_check_time=0.0,
-                escalated=False
-            )
-            # Remove from pending orders
+            existing = self.positions.get(side)
+            if existing is None:
+                entry_time = time.time()
+                self.positions[side] = PositionEntry(
+                    side=side,
+                    quantity=quantity,
+                    entry_time=entry_time,
+                    buy_order_id=order_id,
+                    last_bid_check_time=0.0,
+                    escalated=False
+                )
+            else:
+                existing.quantity += quantity
+                existing.buy_order_id = order_id
+
+            # Remove from pending orders (if tracked)
             if order_id in self.pending_orders:
                 del self.pending_orders[order_id]
 
@@ -630,6 +646,28 @@ class PositionTracker:
         async with self.lock:
             if side in self.positions:
                 del self.positions[side]
+
+    async def apply_sell_fill(self, side: str, quantity: int) -> int:
+        """
+        Apply a sell fill to the tracked position.
+        
+        Decrements the position quantity by `quantity`. If the remaining
+        quantity is <= 0, clears the position.
+        
+        Returns:
+            Remaining quantity after applying the fill (0 if cleared, or if no position).
+        """
+        async with self.lock:
+            pos = self.positions.get(side)
+            if pos is None:
+                return 0
+
+            pos.quantity -= quantity
+            if pos.quantity <= 0:
+                del self.positions[side]
+                return 0
+
+            return pos.quantity
 
     async def update_sell_order(self, side: str, sell_order_id: str, sell_price: int):
         async with self.lock:
