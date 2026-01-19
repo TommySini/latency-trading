@@ -132,11 +132,19 @@ class OrderBook:
 # Websocket Streamer
 # -----------------------------
 class MarketDataStreamer(KalshiWebSocketClient):
-    def __init__(self, key_id: str, private_key, market_ticker: str, position_tracker: Optional[PositionTracker] = None):
+    def __init__(
+        self,
+        key_id: str,
+        private_key,
+        market_ticker: str,
+        position_tracker: Optional[PositionTracker] = None,
+        http_client: Optional[KalshiHttpClient] = None,
+    ):
         super().__init__(key_id=key_id, private_key=private_key)
         self.market_ticker = market_ticker
         self.book = OrderBook(market_ticker=market_ticker)
         self.position_tracker = position_tracker
+        self.http_client = http_client
 
         self._cmd_id = 1
         self._orderbook_sid: Optional[int] = None  # IMPORTANT: subscription id for orderbook_delta
@@ -204,6 +212,8 @@ class MarketDataStreamer(KalshiWebSocketClient):
         action = fill_msg.get("action")  # "buy" or "sell"
         side = fill_msg.get("side")  # "yes" or "no"
         order_id = fill_msg.get("order_id")
+        trade_id = fill_msg.get("trade_id")  # unique per fill
+        ts = fill_msg.get("ts")  # unix seconds for when fill happened
         count = fill_msg.get("count", 0)  # quantity filled
         
         if not action or not side:
@@ -212,24 +222,34 @@ class MarketDataStreamer(KalshiWebSocketClient):
             return
         
         if action == "buy":
-            # Buy fill - register/augment position; supports partial fills accumulating
-            await self.position_tracker.register_filled_position(side, count, order_id)
-            sys.stdout.write(f"\n[FILL] {side.upper()} BUY - {count} shares filled - Order ID: {order_id}\n")
+            # Buy fill:
+            # Each fill event becomes its own independent liquidation lot.
+            lot_id = await self.position_tracker.register_filled_lot(
+                side=side,
+                quantity=count,
+                order_id=order_id,
+                trade_id=trade_id,
+                ts=ts,
+            )
+            sys.stdout.write(f"\n[FILL] {side.upper()} BUY - {count} shares filled - Order ID: {order_id} - Trade ID: {trade_id} - Lot: {lot_id}\n")
             sys.stdout.flush()
         elif action == "sell":
-            # Sell fill - decrement position quantity; supports partial fills
-            remaining = await self.position_tracker.apply_sell_fill(side, count)
-            if remaining > 0:
-                sys.stdout.write(
-                    f"\n[FILL] {side.upper()} SELL - {count} shares filled - "
-                    f"Order ID: {order_id} - Remaining position: {remaining}\n"
-                )
+            # Sell fill - route to the correct lot by sell order id
+            lot_id = await self.position_tracker.find_lot_id_by_sell_order(order_id)
+            if lot_id is not None:
+                remaining = await self.position_tracker.reduce_lot_on_sell(lot_id, count)
+                if remaining <= 0:
+                    sys.stdout.write(f"\n[FILL] {side.upper()} SELL - {count} shares filled - Order ID: {order_id} - Lot liquidated: {lot_id}\n")
+                    sys.stdout.flush()
+                    await self.position_tracker.remove_lot(lot_id)
+                else:
+                    # Trigger fast re-check by resetting last_bid_check_time
+                    await self.position_tracker.update_bid_check_time(lot_id, 0.0)
+                    sys.stdout.write(f"\n[FILL] {side.upper()} SELL PARTIAL - {count} filled - Remaining: {remaining} - Order ID: {order_id} - Lot: {lot_id}\n")
+                    sys.stdout.flush()
             else:
-                sys.stdout.write(
-                    f"\n[FILL] {side.upper()} SELL - {count} shares filled - "
-                    f"Order ID: {order_id} - Position fully liquidated\n"
-                )
-            sys.stdout.flush()
+                sys.stdout.write(f"\n[FILL] {side.upper()} SELL - {count} shares filled - Order ID: {order_id} - No lot found\n")
+                sys.stdout.flush()
 
     async def process_message(self, message: str):
         """Override to handle orderbook messages, then call super for fills."""
@@ -571,7 +591,8 @@ class PendingBuyOrder:
 
 
 @dataclass
-class PositionEntry:
+class PositionLot:
+    lot_id: str
     side: str  # "yes" or "no"
     quantity: int
     entry_time: float
@@ -585,9 +606,13 @@ class PositionEntry:
 
 class PositionTracker:
     def __init__(self):
-        self.positions: Dict[str, PositionEntry] = {}  # key: side, value: PositionEntry
+        # Per-fill "lots" so each buy fill chunk has its own liquidation lifecycle
+        self.lots: Dict[str, PositionLot] = {}  # key: lot_id
+        # Route sell fills (order_id) back to the originating lot
+        self.sell_order_to_lot: Dict[str, str] = {}  # key: sell_order_id -> lot_id
         self.pending_orders: Dict[str, PendingBuyOrder] = {}  # key: order_id, value: PendingBuyOrder
         self.lock = asyncio.Lock()
+        self._lot_seq: int = 0
 
     async def register_pending_buy_order(self, side: str, quantity: int, order_id: str):
         """Register a pending buy order - will check if filled and register position when filled."""
@@ -598,38 +623,56 @@ class PositionTracker:
                 order_id=order_id,
                 placed_time=time.time()
             )
-    
-    async def register_filled_position(self, side: str, quantity: int, order_id: str):
-        """
-        Register a position when a buy order is filled.
+
+    async def register_filled_lot(
+        self,
+        side: str,
+        quantity: int,
+        order_id: str,
+        trade_id: Optional[str],
+        ts: Optional[int],
+    ) -> str:
+        """Register a new per-fill lot when a buy fill is received.
         
-        Supports partial fills by:
-        - Creating a new PositionEntry if none exists.
-        - Incrementing quantity on an existing position without resetting timers.
+        If a trade_id is provided by the exchange, it is used as the lot_id so
+        each fill chunk is keyed exactly by its unique trade identifier.
         """
         async with self.lock:
-            existing = self.positions.get(side)
-            if existing is None:
-                entry_time = time.time()
-                self.positions[side] = PositionEntry(
-                    side=side,
-                    quantity=quantity,
-                    entry_time=entry_time,
-                    buy_order_id=order_id,
-                    last_bid_check_time=0.0,
-                    escalated=False
-                )
+            # Prefer exchange timestamp if present (seconds), fallback to local time
+            entry_time = float(ts) if ts is not None else time.time()
+            # Prefer exchange-provided trade_id as the lot identifier
+            if trade_id:
+                lot_id = trade_id
             else:
-                existing.quantity += quantity
-                existing.buy_order_id = order_id
-
-            # Remove from pending orders (if tracked)
+                self._lot_seq += 1
+                lot_id = f"{side}:{order_id}:{int(entry_time * 1000)}:{self._lot_seq}"
+            self.lots[lot_id] = PositionLot(
+                lot_id=lot_id,
+                side=side,
+                quantity=quantity,
+                entry_time=entry_time,
+                buy_order_id=order_id,
+                last_bid_check_time=0.0,
+                escalated=False
+            )
+            # Remove from pending orders
             if order_id in self.pending_orders:
                 del self.pending_orders[order_id]
+            return lot_id
 
-    async def get_position(self, side: str) -> Optional[PositionEntry]:
+    async def get_lot(self, lot_id: str) -> Optional[PositionLot]:
         async with self.lock:
-            return self.positions.get(side)
+            return self.lots.get(lot_id)
+
+    async def list_open_lots(self, side: Optional[str] = None) -> List[PositionLot]:
+        async with self.lock:
+            if side is None:
+                return list(self.lots.values())
+            return [lot for lot in self.lots.values() if lot.side == side]
+
+    async def has_open_lots(self, side: str) -> bool:
+        async with self.lock:
+            return any(lot.side == side for lot in self.lots.values())
 
     async def get_pending_orders(self) -> List[PendingBuyOrder]:
         """Get all pending buy orders."""
@@ -642,58 +685,63 @@ class PositionTracker:
             if order_id in self.pending_orders:
                 del self.pending_orders[order_id]
 
-    async def clear_position(self, side: str):
+    async def remove_lot(self, lot_id: str):
         async with self.lock:
-            if side in self.positions:
-                del self.positions[side]
+            lot = self.lots.pop(lot_id, None)
+            if lot and lot.sell_order_id:
+                # Keep mapping cleanup best-effort; late fills will then log "unmapped"
+                self.sell_order_to_lot.pop(lot.sell_order_id, None)
 
-    async def apply_sell_fill(self, side: str, quantity: int) -> int:
-        """
-        Apply a sell fill to the tracked position.
-        
-        Decrements the position quantity by `quantity`. If the remaining
-        quantity is <= 0, clears the position.
-        
-        Returns:
-            Remaining quantity after applying the fill (0 if cleared, or if no position).
-        """
+    async def find_lot_id_by_sell_order(self, sell_order_id: Optional[str]) -> Optional[str]:
+        if not sell_order_id:
+            return None
         async with self.lock:
-            pos = self.positions.get(side)
-            if pos is None:
+            return self.sell_order_to_lot.get(sell_order_id)
+
+    async def reduce_lot_on_sell(self, lot_id: str, filled_qty: int) -> int:
+        """Decrement remaining lot size after a sell fill. Returns remaining quantity."""
+        async with self.lock:
+            lot = self.lots.get(lot_id)
+            if lot is None:
                 return 0
+            lot.quantity = max(0, lot.quantity - filled_qty)
+            return lot.quantity
 
-            pos.quantity -= quantity
-            if pos.quantity <= 0:
-                del self.positions[side]
-                return 0
-
-            return pos.quantity
-
-    async def update_sell_order(self, side: str, sell_order_id: str, sell_price: int):
+    async def update_sell_order(self, lot_id: str, sell_order_id: str, sell_price: int):
         async with self.lock:
-            if side in self.positions:
-                self.positions[side].sell_order_id = sell_order_id
-                self.positions[side].current_sell_price = sell_price
-                self.positions[side].last_bid_check_time = time.time()
+            lot = self.lots.get(lot_id)
+            if lot is None:
+                return
+            lot.sell_order_id = sell_order_id
+            lot.current_sell_price = sell_price
+            lot.last_bid_check_time = time.time()
+            if sell_order_id:
+                self.sell_order_to_lot[sell_order_id] = lot_id
     
-    async def start_liquidation(self, side: str, start_time: float):
-        """Start liquidation for a position."""
+    async def start_liquidation(self, lot_id: str, start_time: float):
+        """Start liquidation for a lot."""
         async with self.lock:
-            if side in self.positions:
-                self.positions[side].liquidation_start_time = start_time
-                self.positions[side].last_bid_check_time = start_time
+            lot = self.lots.get(lot_id)
+            if lot is None:
+                return
+            lot.liquidation_start_time = start_time
+            lot.last_bid_check_time = start_time
     
-    async def update_bid_check_time(self, side: str, check_time: float):
+    async def update_bid_check_time(self, lot_id: str, check_time: float):
         """Update the last bid check time."""
         async with self.lock:
-            if side in self.positions:
-                self.positions[side].last_bid_check_time = check_time
+            lot = self.lots.get(lot_id)
+            if lot is None:
+                return
+            lot.last_bid_check_time = check_time
     
-    async def mark_escalated(self, side: str):
-        """Mark position as escalated."""
+    async def mark_escalated(self, lot_id: str):
+        """Mark lot as escalated."""
         async with self.lock:
-            if side in self.positions:
-                self.positions[side].escalated = True
+            lot = self.lots.get(lot_id)
+            if lot is None:
+                return
+            lot.escalated = True
 
 
 async def keyboard_input_handler(
@@ -721,8 +769,7 @@ async def keyboard_input_handler(
                 
                 if char == 'q':
                     # Check if YES position already exists - prevent new order if not liquidated
-                    existing_pos = await position_tracker.get_position("yes")
-                    if existing_pos is not None:
+                    if await position_tracker.has_open_lots("yes"):
                         sys.stdout.write(f"\n[ORDER ERROR] YES position already exists - cannot place new buy until liquidated\n")
                         sys.stdout.flush()
                         continue
@@ -783,8 +830,7 @@ async def keyboard_input_handler(
                 
                 elif char == 'w':
                     # Check if NO position already exists - prevent new order if not liquidated
-                    existing_pos = await position_tracker.get_position("no")
-                    if existing_pos is not None:
+                    if await position_tracker.has_open_lots("no"):
                         sys.stdout.write(f"\n[ORDER ERROR] NO position already exists - cannot place new buy until liquidated\n")
                         sys.stdout.flush()
                         continue
@@ -874,22 +920,26 @@ async def liquidation_manager(
         
         current_time = time.time()
         
-        # Check each position
-        for side in ["yes", "no"]:
-            pos = await position_tracker.get_position(side)
-            if pos is None:
+        # Check each open lot (each buy fill chunk has its own lifecycle)
+        lots = await position_tracker.list_open_lots()
+        for lot in lots:
+            lot_id = lot.lot_id
+            # Re-fetch to use most recent quantity / state
+            lot = await position_tracker.get_lot(lot_id)
+            if lot is None:
                 continue
             
-            time_since_entry = current_time - pos.entry_time
+            side = lot.side
+            time_since_entry = current_time - lot.entry_time
             
             # Start liquidation 4 seconds after entry (entry_time is set when buy fill is received)
-            if time_since_entry >= 4.0 and pos.liquidation_start_time is None:
-                sys.stdout.write(f"\n[LIQUIDATION] Starting liquidation for {side.upper()} position after {time_since_entry:.2f}s\n")
+            if time_since_entry >= 4.0 and lot.liquidation_start_time is None:
+                sys.stdout.write(f"\n[LIQUIDATION] Starting liquidation for {side.upper()} lot {lot_id} after {time_since_entry:.2f}s\n")
                 sys.stdout.flush()
-                await position_tracker.start_liquidation(side, current_time)
-                # Re-fetch position to get updated values
-                pos = await position_tracker.get_position(side)
-                if pos is None:
+                await position_tracker.start_liquidation(lot_id, current_time)
+                # Re-fetch lot to get updated values
+                lot = await position_tracker.get_lot(lot_id)
+                if lot is None:
                     continue
                 
                 # Get best bid (bid₀) - the lower of the two numbers in the spread
@@ -903,12 +953,12 @@ async def liquidation_manager(
                 if bid is None:
                     sys.stdout.write(f"\n[LIQUIDATION ERROR] {side.upper()} bid missing - panic stop\n")
                     sys.stdout.flush()
-                    if pos.sell_order_id:
+                    if lot.sell_order_id:
                         try:
-                            http_client.cancel_order(pos.sell_order_id)
+                            http_client.cancel_order(lot.sell_order_id)
                         except:
                             pass
-                    await position_tracker.clear_position(side)
+                    await position_tracker.remove_lot(lot_id)
                     continue
                 
                 # Submit LIMIT SELL: price = bid₀, quantity = filled_qty
@@ -917,14 +967,14 @@ async def liquidation_manager(
                         ticker=market_ticker,
                         action="sell",
                         side=side,
-                        count=pos.quantity,
+                        count=lot.quantity,
                         yes_price=bid if side == "yes" else None,
                         no_price=bid if side == "no" else None,
                         order_type="limit"
                     )
                     sell_order_id = result.get("order", {}).get("order_id", "unknown")
-                    await position_tracker.update_sell_order(side, sell_order_id, bid)
-                    sys.stdout.write(f"\n[LIQUIDATION] {side.upper()} SELL @ {bid} - {pos.quantity} shares - Order ID: {sell_order_id}\n")
+                    await position_tracker.update_sell_order(lot_id, sell_order_id, bid)
+                    sys.stdout.write(f"\n[LIQUIDATION] {side.upper()} SELL @ {bid} - {lot.quantity} shares - Lot {lot_id} - Order ID: {sell_order_id}\n")
                     sys.stdout.flush()
                 except Exception as e:
                     sys.stdout.write(f"\n[LIQUIDATION ERROR] {side.upper()} SELL failed: {e}\n")
@@ -932,17 +982,23 @@ async def liquidation_manager(
                     continue
             
             # Bid Adjustment Walkdown Loop - Every 1s
-            if pos.liquidation_start_time is not None:
-                liquidation_age = current_time - pos.liquidation_start_time
+            if lot.liquidation_start_time is not None:
+                liquidation_age = current_time - lot.liquidation_start_time
                 
                 # Check every 1 second
-                if current_time - pos.last_bid_check_time >= 1.0:
-                    await position_tracker.update_bid_check_time(side, current_time)
-                    # Re-fetch position to get updated values
-                    pos = await position_tracker.get_position(side)
-                    if pos is None:
-                        # Position was cleared (likely by sell fill) - exit flow complete
+                if current_time - lot.last_bid_check_time >= 1.0:
+                    # Re-fetch lot to get updated values
+                    lot = await position_tracker.get_lot(lot_id)
+                    if lot is None:
+                        # Lot was cleared (likely by sell fill)
                         continue
+                    
+                    if lot.quantity <= 0:
+                        await position_tracker.remove_lot(lot_id)
+                        continue
+                    
+                    # Mark check time up front to avoid rapid retry loops on errors
+                    await position_tracker.update_bid_check_time(lot_id, current_time)
                     
                     # Read bid_new
                     async with book.lock:
@@ -955,52 +1011,55 @@ async def liquidation_manager(
                     if bid_new is None:
                         sys.stdout.write(f"\n[LIQUIDATION ERROR] {side.upper()} bid missing - panic stop\n")
                         sys.stdout.flush()
-                        if pos.sell_order_id:
+                        if lot.sell_order_id:
                             try:
-                                http_client.cancel_order(pos.sell_order_id)
+                                http_client.cancel_order(lot.sell_order_id)
                             except:
                                 pass
-                        await position_tracker.clear_position(side)
+                        await position_tracker.remove_lot(lot_id)
                         continue
                     
-                    # If bid_new ≠ current_price → cancel/replace sell at bid_new
-                    if bid_new != pos.current_sell_price:
-                        if pos.sell_order_id:
-                            try:
-                                http_client.cancel_order(pos.sell_order_id)
-                            except:
-                                pass
-                        
-                        # Place new sell order at new bid
+                    # Determine target price (respect escalation offset when set)
+                    target_price = bid_new
+                    if lot.escalated:
+                        target_price = max(1, bid_new - 2)
+                    
+                    # Always cancel and replace at the current best bid (or aggressive bid) with remaining size
+                    if lot.sell_order_id:
                         try:
-                            result = http_client.create_order(
-                                ticker=market_ticker,
-                                action="sell",
-                                side=side,
-                                count=pos.quantity,
-                                yes_price=bid_new if side == "yes" else None,
-                                no_price=bid_new if side == "no" else None,
-                                order_type="limit"
-                            )
-                            sell_order_id = result.get("order", {}).get("order_id", "unknown")
-                            await position_tracker.update_sell_order(side, sell_order_id, bid_new)
-                            sys.stdout.write(f"\n[LIQUIDATION] {side.upper()} REPRICE @ {bid_new} - Order ID: {sell_order_id}\n")
-                            sys.stdout.flush()
-                        except Exception as e:
-                            sys.stdout.write(f"\n[LIQUIDATION ERROR] {side.upper()} REPRICE failed: {e}\n")
-                            sys.stdout.flush()
+                            http_client.cancel_order(lot.sell_order_id)
+                        except:
+                            pass
+                    
+                    try:
+                        result = http_client.create_order(
+                            ticker=market_ticker,
+                            action="sell",
+                            side=side,
+                            count=lot.quantity,
+                            yes_price=target_price if side == "yes" else None,
+                            no_price=target_price if side == "no" else None,
+                            order_type="limit"
+                        )
+                        sell_order_id = result.get("order", {}).get("order_id", "unknown")
+                        await position_tracker.update_sell_order(lot_id, sell_order_id, target_price)
+                        sys.stdout.write(f"\n[LIQUIDATION] {side.upper()} REPRICE @ {target_price} - Remaining {lot.quantity} - Lot {lot_id} - Order ID: {sell_order_id}\n")
+                        sys.stdout.flush()
+                    except Exception as e:
+                        sys.stdout.write(f"\n[LIQUIDATION ERROR] {side.upper()} REPRICE failed: {e}\n")
+                        sys.stdout.flush()
                 
                 # Exit Timeout Escalation - If still not fully liquidated 10.0s after liquidation start
-                if liquidation_age >= 10.0 and not pos.escalated and pos.sell_order_id:
-                    await position_tracker.mark_escalated(side)
-                    # Re-fetch position to get updated values
-                    pos = await position_tracker.get_position(side)
-                    if pos is None:
+                if liquidation_age >= 10.0 and not lot.escalated and lot.sell_order_id:
+                    await position_tracker.mark_escalated(lot_id)
+                    # Re-fetch lot to get updated values
+                    lot = await position_tracker.get_lot(lot_id)
+                    if lot is None:
                         continue
                     
                     # Cancel resting sell
                     try:
-                        http_client.cancel_order(pos.sell_order_id)
+                        http_client.cancel_order(lot.sell_order_id)
                     except:
                         pass
                     
@@ -1014,7 +1073,7 @@ async def liquidation_manager(
                     if bid_aggressive is None:
                         sys.stdout.write(f"\n[LIQUIDATION ERROR] {side.upper()} bid missing during escalation - panic stop\n")
                         sys.stdout.flush()
-                        await position_tracker.clear_position(side)
+                        await position_tracker.remove_lot(lot_id)
                         continue
                     
                     # Submit more aggressive LIMIT SELL at: price = best_bid − 0.02
@@ -1025,14 +1084,14 @@ async def liquidation_manager(
                             ticker=market_ticker,
                             action="sell",
                             side=side,
-                            count=pos.quantity,
+                            count=lot.quantity,
                             yes_price=aggressive_price if side == "yes" else None,
                             no_price=aggressive_price if side == "no" else None,
                             order_type="limit"
                         )
                         sell_order_id = result.get("order", {}).get("order_id", "unknown")
-                        await position_tracker.update_sell_order(side, sell_order_id, aggressive_price)
-                        sys.stdout.write(f"\n[LIQUIDATION ESCALATE] {side.upper()} SELL @ {aggressive_price} (bid-2) - Order ID: {sell_order_id}\n")
+                        await position_tracker.update_sell_order(lot_id, sell_order_id, aggressive_price)
+                        sys.stdout.write(f"\n[LIQUIDATION ESCALATE] {side.upper()} SELL @ {aggressive_price} (bid-2) - Lot {lot_id} - Order ID: {sell_order_id}\n")
                         sys.stdout.flush()
                     except Exception as e:
                         sys.stdout.write(f"\n[LIQUIDATION ERROR] {side.upper()} ESCALATE failed: {e}\n")
@@ -1042,7 +1101,13 @@ async def liquidation_manager(
 async def run_stream(key_id: str, private_key, market_ticker: str):
     http_client = KalshiHttpClient(key_id=key_id, private_key=private_key)
     position_tracker = PositionTracker()
-    streamer = MarketDataStreamer(key_id=key_id, private_key=private_key, market_ticker=market_ticker, position_tracker=position_tracker)
+    streamer = MarketDataStreamer(
+        key_id=key_id,
+        private_key=private_key,
+        market_ticker=market_ticker,
+        position_tracker=position_tracker,
+        http_client=http_client,
+    )
 
     # Seed from REST once (fast + confirms real liquidity)
     try:
