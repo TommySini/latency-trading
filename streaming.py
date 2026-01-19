@@ -503,7 +503,7 @@ def seed_book_with_rest_snapshot(market_ticker: str) -> Tuple[List[List[int]], L
 # -----------------------------
 # Position Sizing Configuration
 # -----------------------------
-POSITION_PCT = 0.01  # % of portfolio to trade
+POSITION_PCT = 0.25  # % of portfolio to trade
 
 
 def compute_shares_from_budget(target_usd: float, price_cents: int) -> Optional[int]:
