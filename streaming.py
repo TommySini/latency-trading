@@ -527,7 +527,7 @@ def seed_book_with_rest_snapshot(market_ticker: str) -> Tuple[List[List[int]], L
 # -----------------------------
 # Position Sizing Configuration
 # -----------------------------
-POSITION_PCT = 0.005  # % of portfolio to trade
+POSITION_PCT = 0.15  # % of portfolio to trade
 
 
 def compute_shares_from_budget(target_usd: float, price_cents: int) -> Optional[int]:
@@ -910,7 +910,7 @@ async def liquidation_manager(
 ):
     """
     Manages liquidation of positions following exact specification:
-    - Starts 4 seconds after entry
+    - Starts 6 seconds after entry
     - Places sell order at best bid (bid₀)
     - Every 1s: checks if position flat, then checks if bid changed and cancels/replaces
     - After 10s: escalates with bid - 0.02
@@ -932,8 +932,8 @@ async def liquidation_manager(
             side = lot.side
             time_since_entry = current_time - lot.entry_time
             
-            # Start liquidation 4 seconds after entry (entry_time is set when buy fill is received)
-            if time_since_entry >= 4.0 and lot.liquidation_start_time is None:
+            # Start liquidation 6 seconds after entry (entry_time is set when buy fill is received)
+            if time_since_entry >= 6.0 and lot.liquidation_start_time is None:
                 sys.stdout.write(f"\n[LIQUIDATION] Starting liquidation for {side.upper()} lot {lot_id} after {time_since_entry:.2f}s\n")
                 sys.stdout.flush()
                 await position_tracker.start_liquidation(lot_id, current_time)
