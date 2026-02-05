@@ -233,23 +233,31 @@ class MarketDataStreamer(KalshiWebSocketClient):
             )
             sys.stdout.write(f"\n[FILL] {side.upper()} BUY - {count} shares filled - Order ID: {order_id} - Trade ID: {trade_id} - Lot: {lot_id}\n")
             sys.stdout.flush()
-        elif action == "sell":
-            # Sell fill - route to the correct lot by sell order id
-            lot_id = await self.position_tracker.find_lot_id_by_sell_order(order_id)
-            if lot_id is not None:
-                remaining = await self.position_tracker.reduce_lot_on_sell(lot_id, count)
-                if remaining <= 0:
-                    sys.stdout.write(f"\n[FILL] {side.upper()} SELL - {count} shares filled - Order ID: {order_id} - Lot liquidated: {lot_id}\n")
-                    sys.stdout.flush()
-                    await self.position_tracker.remove_lot(lot_id)
-                else:
-                    # Trigger fast re-check by resetting last_bid_check_time
-                    await self.position_tracker.update_bid_check_time(lot_id, 0.0)
-                    sys.stdout.write(f"\n[FILL] {side.upper()} SELL PARTIAL - {count} filled - Remaining: {remaining} - Order ID: {order_id} - Lot: {lot_id}\n")
-                    sys.stdout.flush()
-            else:
-                sys.stdout.write(f"\n[FILL] {side.upper()} SELL - {count} shares filled - Order ID: {order_id} - No lot found\n")
-                sys.stdout.flush()
+        # DISABLED: sell logic commented out
+        # elif action == "sell":
+        #     # Sell fill - route to the correct lot by sell order id
+        #     lot_id = await self.position_tracker.find_lot_id_by_sell_order(order_id)
+        #     if lot_id is not None:
+        #         # Verify this fill is from the current sell order, not a stale/cancelled one
+        #         lot = await self.position_tracker.get_lot(lot_id)
+        #         if lot is None or lot.sell_order_id != order_id:
+        #             sys.stdout.write(f"\n[FILL IGNORED] Stale sell fill from cancelled order - Order ID: {order_id} - Lot: {lot_id} - Current order: {lot.sell_order_id if lot else 'none'}\n")
+        #             sys.stdout.flush()
+        #             return
+        #
+        #         remaining = await self.position_tracker.reduce_lot_on_sell(lot_id, count)
+        #         if remaining <= 0:
+        #             sys.stdout.write(f"\n[FILL] {side.upper()} SELL - {count} shares filled - Order ID: {order_id} - Lot liquidated: {lot_id}\n")
+        #             sys.stdout.flush()
+        #             await self.position_tracker.remove_lot(lot_id)
+        #         else:
+        #             # Trigger fast re-check by resetting last_bid_check_time
+        #             await self.position_tracker.update_bid_check_time(lot_id, 0.0)
+        #             sys.stdout.write(f"\n[FILL] {side.upper()} SELL PARTIAL - {count} filled - Remaining: {remaining} - Order ID: {order_id} - Lot: {lot_id}\n")
+        #             sys.stdout.flush()
+        #     else:
+        #         sys.stdout.write(f"\n[FILL] {side.upper()} SELL - {count} shares filled - Order ID: {order_id} - No lot found\n")
+        #         sys.stdout.flush()
 
     async def process_message(self, message: str):
         """Override to handle orderbook messages, then call super for fills."""
@@ -527,7 +535,7 @@ def seed_book_with_rest_snapshot(market_ticker: str) -> Tuple[List[List[int]], L
 # -----------------------------
 # Position Sizing Configuration
 # -----------------------------
-POSITION_PCT = 0.15  # % of portfolio to trade
+POSITION_PCT = 0.25  # % of portfolio to trade
 
 
 def compute_shares_from_budget(target_usd: float, price_cents: int) -> Optional[int]:
@@ -712,6 +720,9 @@ class PositionTracker:
             lot = self.lots.get(lot_id)
             if lot is None:
                 return
+            # Remove old mapping to prevent stale/cancelled order fills from being processed
+            if lot.sell_order_id and lot.sell_order_id in self.sell_order_to_lot:
+                del self.sell_order_to_lot[lot.sell_order_id]
             lot.sell_order_id = sell_order_id
             lot.current_sell_price = sell_price
             lot.last_bid_check_time = time.time()
@@ -768,12 +779,13 @@ async def keyboard_input_handler(
                 char = sys.stdin.read(1)
                 
                 if char == 'q':
-                    # Check if YES position already exists - prevent new order if not liquidated
-                    if await position_tracker.has_open_lots("yes"):
-                        sys.stdout.write(f"\n[ORDER ERROR] YES position already exists - cannot place new buy until liquidated\n")
-                        sys.stdout.flush()
-                        continue
-                    
+                    # DISABLED: position check commented out
+                    # # Check if YES position already exists - prevent new order if not liquidated
+                    # if await position_tracker.has_open_lots("yes"):
+                    #     sys.stdout.write(f"\n[ORDER ERROR] YES position already exists - cannot place new buy until liquidated\n")
+                    #     sys.stdout.flush()
+                    #     continue
+
                     # Fetch portfolio balance
                     try:
                         balance_data = http_client.get_balance()
@@ -829,12 +841,13 @@ async def keyboard_input_handler(
                         sys.stdout.flush()
                 
                 elif char == 'w':
-                    # Check if NO position already exists - prevent new order if not liquidated
-                    if await position_tracker.has_open_lots("no"):
-                        sys.stdout.write(f"\n[ORDER ERROR] NO position already exists - cannot place new buy until liquidated\n")
-                        sys.stdout.flush()
-                        continue
-                    
+                    # DISABLED: position check commented out
+                    # # Check if NO position already exists - prevent new order if not liquidated
+                    # if await position_tracker.has_open_lots("no"):
+                    #     sys.stdout.write(f"\n[ORDER ERROR] NO position already exists - cannot place new buy until liquidated\n")
+                    #     sys.stdout.flush()
+                    #     continue
+
                     # Fetch portfolio balance
                     try:
                         balance_data = http_client.get_balance()
@@ -1123,7 +1136,7 @@ async def run_stream(key_id: str, private_key, market_ticker: str):
         streamer.connect(),
         print_tape_every_1ms(streamer.book, http_client),
         keyboard_input_handler(streamer.book, http_client, market_ticker, position_tracker),
-        liquidation_manager(streamer.book, http_client, market_ticker, position_tracker),
+        # liquidation_manager(streamer.book, http_client, market_ticker, position_tracker),  # DISABLED: sell logic commented out
     )
 
 
